@@ -1,5 +1,6 @@
 # 算力修仙笔记：LeetGPU 三十题
 网址：https://leetgpu.com/challenges
+力扣GPU版，本文旨在提供详尽题解与思路。
 ## easy
 ### Vector Addition
 环境: B200 + CUDA
@@ -49,105 +50,52 @@ extern "C" void solve(const float* A, const float* B, float* C, int N) {
 ```
 0.06307 ms 61.4th percentile
 运用了GPU向量化访存的特性，float4占32*4=128位，运行时调用向量寄存器，访存大幅加快。
-#### 流水线
+
+#### 编译加速
 ```CUDA
 #include <cuda_runtime.h>
-#include <stdint.h>
+#include <cstdint>
 
-#ifndef BLOCK_SIZE
-#define BLOCK_SIZE 256
-#endif
-
-// 1-stage 软件流水：每线程按 grid-stride 处理多段 float4
-__global__ void vecadd_v4_pipeline_cg(const float* __restrict__ A,
-                                      const float* __restrict__ B,
-                                      float* __restrict__ C,
-                                      int N, int N_vec4 /* (N+3)/4 */)
-{
-    const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = blockDim.x * gridDim.x;
-
-    const int last_vec = N_vec4 - 1;
-
-    auto ld4 = [](const float* p, float &x, float &y, float &z, float &w) {
-#if __CUDA_ARCH__ >= 800
-        asm volatile("ld.global.cg.v4.f32 {%0,%1,%2,%3}, [%4];\n\t"
-            : "=f"(x), "=f"(y), "=f"(z), "=f"(w) : "l"(p));
-#else
-        x=p[0]; y=p[1]; z=p[2]; w=p[3];
-#endif
-    };
-    auto st4 = [](float* p, float x, float y, float z, float w) {
-#if __CUDA_ARCH__ >= 800
-        asm volatile("st.global.wb.v4.f32 [%4], {%0,%1,%2,%3};\n\t"
-            : : "f"(x), "f"(y), "f"(z), "f"(w), "l"(p));
-#else
-        p[0]=x; p[1]=y; p[2]=z; p[3]=w;
-#endif
-    };
-
-    // 预取第一块
-    int i4 = tid;
-    if (i4 >= N_vec4) return;
-
-    float ax,ay,az,aw, bx,by,bz,bw;
-    float nx,ny,nz,nw, mx,my,mz,mw; // next buffers
-
-    const float* Ap = A + ((size_t)i4 << 2);
-    const float* Bp = B + ((size_t)i4 << 2);
-    ld4(Ap, ax,ay,az,aw);
-    ld4(Bp, bx,by,bz,bw);
-
-    for (;;)
-    {
-        // 预取下一块到 next 寄存器
-        int i4n = i4 + stride;
-        bool has_next = (i4n < N_vec4);
-        if (has_next) {
-            const float* An = A + ((size_t)i4n << 2);
-            const float* Bn = B + ((size_t)i4n << 2);
-            ld4(An, nx,ny,nz,nw);
-            ld4(Bn, mx,my,mz,mw);
-        }
-
-        // 计算当前
-        float sx = ax + bx;
-        float sy = ay + by;
-        float sz = az + bz;
-        float sw = aw + bw;
-
-        const int base = i4 << 2;
-        if (i4 != last_vec) {
-            // 热路径：向量化写
-            st4(C + base, sx,sy,sz,sw);
-        } else {
-            // 仅尾块掩码写
-            if (base + 0 < N) C[base + 0] = sx;
-            if (base + 1 < N) C[base + 1] = sy;
-            if (base + 2 < N) C[base + 2] = sz;
-            if (base + 3 < N) C[base + 3] = sw;
-        }
-
-        if (!has_next) break;
-
-        // 滚动寄存器，进入下一轮
-        i4 = i4n;
-        ax=nx; ay=ny; az=nz; aw=nw;
-        bx=mx; by=my; bz=mz; bw=mw;
+__global__ void vecadd4_kernel(const float4* __restrict__ A4,
+                               const float4* __restrict__ B4,
+                               float4* __restrict__ C4,
+                               int N4) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N4) {
+        float4 a = A4[idx];
+        float4 b = B4[idx];
+        C4[idx] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
     }
 }
 
-extern "C" void solve(const float* A, const float* B, float* C, int N)
-{
-    if (N <= 0) return;
-    const int N_vec4 = (N + 3) >> 2;
+__global__ void tail_kernel(const float* __restrict__ A,
+                            const float* __restrict__ B,
+                            float* __restrict__ C,
+                            int start, int N) {
+    int i = start + blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) C[i] = A[i] + B[i];
+}
 
-    // 适度超额并行
-    int blocks = (N_vec4 + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    blocks = min(blocks * 4, 8192);
+extern "C" void solve(const float* A, const float* B, float* C, int N) {
+    int N4   = N >> 2;        // N / 4
+    int tail = N & 3;         // N % 4
 
-    vecadd_v4_pipeline_cg<<<blocks, BLOCK_SIZE>>>(A, B, C, N, N_vec4);
-    // cudaDeviceSynchronize();
+    if (N4 > 0) {
+        const float4* A4 = reinterpret_cast<const float4*>(A);
+        const float4* B4 = reinterpret_cast<const float4*>(B);
+        float4*       C4 = reinterpret_cast<float4*>(C);
+
+        int threads = 256;
+        int blocks  = (N4 + threads - 1) / threads;
+        vecadd4_kernel<<<blocks, threads>>>(A4, B4, C4, N4);
+    }
+
+    if (tail) {
+        int start   = N & ~3; // 4 对齐的起点
+        // 1 个 block、32 线程足够处理 <=3 的尾巴
+        tail_kernel<<<1, 32>>>(A, B, C, start, N);
+    }
 }
 ```
-0.05376 ms 78.0th percentile
+0.05337 ms 80.0th percentile
+加上__restrict__编译选项，并且把尾部另外起了一个kernel避免在主kernel中串行，提高效率。
