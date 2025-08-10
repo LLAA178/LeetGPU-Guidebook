@@ -236,6 +236,186 @@ extern "C" void solve(
 - restrict限定符，设定内存不重叠方便编译优化
 - 去除了显式的device同步
 
+进一步了解：https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
 
+### [色彩反转](https://leetgpu.com/challenges/color-inversion)
+#### 基础版
+```cuda
+#include <cuda_runtime.h>
+
+__global__ void invert_kernel(unsigned char* image, int width, int height) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx >= width * height) return;
+    image[idx * 4]      = 255 - image[idx * 4];
+    image[idx * 4 + 1]  = 255 - image[idx * 4 + 1];
+    image[idx * 4 + 2]  = 255 - image[idx * 4 + 2];
+}
+// image_input, image_output are device pointers (i.e. pointers to memory on the GPU)
+extern "C" void solve(unsigned char* image, int width, int height) {
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (width * height + threadsPerBlock - 1) / threadsPerBlock;
+    invert_kernel<<<blocksPerGrid, threadsPerBlock>>>(image, width, height);
+    //cudaDeviceSynchronize();
+}
+```
+0.06884 ms 21.2th percentile
+
+每个线程获取32位，反转前24位rgb即可。
+
+#### 位运算
+```cuda
+__global__ void invert_kernel(unsigned char* image, int width, int height) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx >= width * height) return;
+    auto flip24 = [](int32_t x) -> int32_t {
+    // XOR 后低 24 位翻转，高 8 位不变
+        return x ^ 0xFFFFFF;
+    };
+    int temp = flip24(reinterpret_cast<int32_t*>(image)[idx]);
+    reinterpret_cast<int32_t*>(image)[idx] = temp;
+}
+```
+0.06728 ms 40.2th percentile
+
+使用位运算函数直接反转32位，替换了逐个元素反转。
+
+#### 向量化
+```cuda
+#define BLOCK_SIZE 256
+__global__ void invert_kernel(unsigned char* image, int width, int height) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx > width * height / 4) return;
+    auto flip24 = [](int32_t x) -> int32_t {
+    // XOR 后低 24 位翻转，高 8 位不变
+        return x ^ 0xFFFFFF;
+    };
+    if(idx == width * height / 4){
+        if(width * height % 4 == 0)
+            return;
+        #pragma unroll
+        for(int i = idx * 4; i < width * height; i++){
+            int temp = flip24(reinterpret_cast<int32_t*>(image)[i]);
+            reinterpret_cast<int32_t*>(image)[i] = temp;
+        }
+        return;
+    }
+    auto temp = reinterpret_cast<int4*>(image)[idx];
+    //__syncthreads();
+    reinterpret_cast<int4*>(image)[idx] = make_int4(flip24(temp.x), flip24(temp.y), 
+    flip24(temp.z), flip24(temp.w));
+}
+```
+0.03529 ms 78.4th percentile
+
+经典向量化加快访存。
+
+#### 流水线
+```cuda
+#include <cuda_runtime.h>
+#include <stdint.h>
+#include <algorithm>
+
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 128
+#endif
+
+// 低 24 位取反（RGB），A 不变
+__device__ __forceinline__ uint32_t flip24(uint32_t x) { return x ^ 0x00FFFFFFu; }
+
+// 128-bit streaming load（L1 no-allocate + L2 128B），失败则退化为普通加载
+__device__ __forceinline__ uint4 ld_stream128(const uint4* ptr) {
+#if __CUDA_ARCH__ >= 900  // Hopper/Blackwell
+    uint4 v;
+    asm volatile(
+        "ld.global.nc.L1::no_allocate.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+        : "l"(ptr));
+    return v;
+#else
+    return *ptr;
+#endif
+}
+
+// 128-bit streaming store
+__device__ __forceinline__ void st_stream128(uint4* ptr, const uint4& v) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile(
+        "st.global.wb.v4.u32 [%0], {%1,%2,%3,%4};\n" ::
+        "l"(ptr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+#else
+    *ptr = v;
+#endif
+}
+
+__global__ void invert_rgba_prefetch(uint32_t* __restrict__ data, size_t num_pixels)
+{
+    // 以 4 像素（16B）为一组
+    size_t n4 = num_pixels >> 2;
+    uint4* __restrict__ p4 = reinterpret_cast<uint4*>(data);
+
+    size_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+
+    // 软件流水线：先预取一组
+    if (tid < n4) {
+        size_t j  = tid;
+        uint4 r0  = ld_stream128(p4 + j);
+        j += stride;
+
+        // 主体：每轮预取下一组 r1，同时处理并写回 r0
+        for (; j < n4; j += stride) {
+            uint4 r1 = ld_stream128(p4 + j);
+
+            r0.x = flip24(r0.x);
+            r0.y = flip24(r0.y);
+            r0.z = flip24(r0.z);
+            r0.w = flip24(r0.w);
+            st_stream128(p4 + (j - stride), r0);
+
+            r0 = r1; // 滑动窗口
+        }
+
+        // 收尾：把最后一组 r0 写回
+        r0.x = flip24(r0.x);
+        r0.y = flip24(r0.y);
+        r0.z = flip24(r0.z);
+        r0.w = flip24(r0.w);
+        st_stream128(p4 + (j - stride), r0);
+    }
+
+    // 处理余数（不足 4 像素）——单线程避免竞争
+    if ((num_pixels & 3) && tid == 0) {
+        for (size_t k = (n4 << 2); k < num_pixels; ++k) {
+            data[k] = flip24(data[k]);
+        }
+    }
+}
+
+extern "C" void solve(unsigned char* image, int width, int height) {
+    const size_t N = (size_t)width * (size_t)height;
+    uint32_t* data = reinterpret_cast<uint32_t*>(image);
+
+    int sm = 148; //cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, 0);
+    const int threads = BLOCK_SIZE;
+    size_t n4 = N >> 2;
+
+    int blocks;
+    if (n4 == 0) blocks = 1;
+    else {
+        // 轻度超额订阅（8–12×SM），并受需求上限约束
+        int target = sm * 22;
+        size_t need = (n4 + threads - 1) / threads;
+        blocks = std::max(1, (int)std::min((size_t)target, need));
+    }
+
+    invert_rgba_prefetch<<<blocks, threads>>>(data, N);
+}
+```
+0.03195 ms 99.0th percentile
+
+这里运用了一些高级特性
+- 流水线：每轮预取下一次的输入，增加吞吐
+- ptx：直接指定底层访存指令
+- 限制block数：148为B200 SM数，防止带宽阻塞
 
 
