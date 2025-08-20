@@ -4,9 +4,10 @@
 力扣GPU版，本文旨在提供详尽题解与思路。
 
 ## 简单题
-### [向量相加](https://leetgpu.com/challenges/vector-addition)
-环境: B200 + CUDA
-#### 基础实现
+### [vector-addition](https://leetgpu.com/challenges/vector-addition)
+*环境: B200 + CUDA*
+
+> 基础实现
 ```CUDA
 #include <cuda_runtime.h>
 
@@ -28,7 +29,8 @@ extern "C" void solve(const float* A, const float* B, float* C, int N) {
 0.09953 ms 11.4th percentile
 
 这两个数据分别为运行耗时，百分比排名。耗时越少，百分比排名越大。
-#### 向量化
+
+> 向量化
 ```CUDA
 #include <cuda_runtime.h>
 
@@ -55,7 +57,7 @@ extern "C" void solve(const float* A, const float* B, float* C, int N) {
 
 运用了GPU向量化访存的特性，float4占32*4=128位，运行时调用向量寄存器，访存大幅加快。但是需要额外处理数据不足4的情况。
 
-#### 编译加速
+> 编译加速
 ```CUDA
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -105,8 +107,40 @@ extern "C" void solve(const float* A, const float* B, float* C, int N) {
 
 加上__restrict__编译选项，并且把尾部另外起了一个kernel避免在主kernel中串行，提高效率。
 
-### [矩阵转置](https://leetgpu.com/challenges/matrix-transpose)
-#### 基础实现
+### [matrix-multiplication](https://leetgpu.com/challenges/matrix-multiplication)
+> 基础款
+```cuda
+#include <cuda_runtime.h>
+
+__global__ void matrix_multiplication_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if(row < M && col < K){
+        float sum = 0.0f;
+        #pragma unroll
+        for(int r = 0; r < N; r++){
+            sum += A[row * N + r] * B[r * K + col];
+        }
+        C[row * K + col] = sum;
+    }
+}
+
+// A, B, C are device pointers (i.e. pointers to memory on the GPU)
+extern "C" void solve(const float* A, const float* B, float* C, int M, int N, int K) {
+    dim3 threadsPerBlock(16, 16);
+    dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                       (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    matrix_multiplication_kernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K);
+    cudaDeviceSynchronize();
+}
+```
+71.06379 ms 27.0th percentile
+
+冷知识：GEMM是AI使用最多的算子。
+
+### [matrix-transpose](https://leetgpu.com/challenges/matrix-transpose)
+
+> 基础实现
 ```cuda
 #include <cuda_runtime.h>
 #define BLOCK_SIZE 32
@@ -130,7 +164,8 @@ extern "C" void solve(const float* input, float* output, int rows, int cols) {
 0.27386 ms 18.9th percentile
 
 中规中矩，将输入的行列互换赋值到输出。
-#### 共享内存基础版
+
+> 共享内存基础版
 ```cuda
 #define BLOCK_SIZE 16
 __global__ void matrix_transpose_kernel(const float* input, float* output, int rows, int cols) {
@@ -146,7 +181,8 @@ __global__ void matrix_transpose_kernel(const float* input, float* output, int r
 0.18147 ms 35.9th percentile
 
 仅仅访存时经过共享内存，就有大幅提升。原因是input数组的访存在warp内(threadIdx.x增长方向，即c）是连续的，走共享内存时可以合并。
-#### 共享内存进阶版
+
+> 共享内存进阶版
 ```cuda
 #define BLOCK_SIZE 16
 __global__ void matrix_transpose_kernel(const float* input, float* output, int rows, int cols) {
@@ -171,7 +207,7 @@ __global__ void matrix_transpose_kernel(const float* input, float* output, int r
 为什么共享内存可以跨行访问，但是输入输出数组不能呢？
 因为共享内存访存效率非常高，和L1缓存相当，约几十个cycles，但input/output属于global显存，每次访问需要上百个cycles，不合并的话效率非常低下。
 
-#### 终极版
+> 终极版
 ```cuda
 // solution.cu
 #include <cuda_runtime.h>
@@ -238,8 +274,9 @@ extern "C" void solve(
 
 进一步了解：https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
 
-### [色彩反转](https://leetgpu.com/challenges/color-inversion)
-#### 基础版
+### [color-inversion](https://leetgpu.com/challenges/color-inversion)
+
+> 基础版
 ```cuda
 #include <cuda_runtime.h>
 
@@ -262,7 +299,7 @@ extern "C" void solve(unsigned char* image, int width, int height) {
 
 每个线程获取32位，反转前24位rgb即可。
 
-#### 位运算
+> 位运算
 ```cuda
 __global__ void invert_kernel(unsigned char* image, int width, int height) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -279,7 +316,7 @@ __global__ void invert_kernel(unsigned char* image, int width, int height) {
 
 使用位运算函数直接反转32位，替换了逐个元素反转。
 
-#### 向量化
+> 向量化
 ```cuda
 #define BLOCK_SIZE 256
 __global__ void invert_kernel(unsigned char* image, int width, int height) {
@@ -309,7 +346,7 @@ __global__ void invert_kernel(unsigned char* image, int width, int height) {
 
 经典向量化加快访存。
 
-#### 流水线
+> 流水线
 ```cuda
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -418,4 +455,69 @@ extern "C" void solve(unsigned char* image, int width, int height) {
 - ptx：直接指定底层访存指令
 - 限制block数：148为B200 SM数，防止带宽阻塞
 
+### [1d-convolution](https://leetgpu.com/challenges/1d-convolution)
+> 基础版
+```cuda
+#include <cuda_runtime.h>
+__global__ void convolution_1d_kernel(const float* input, const float* kernel, float* output,
+                                      int input_size, int kernel_size) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx >= input_size - kernel_size + 1) return;
+    float temp = 0.0f;
+    #pragma unroll
+    for(int i = 0; i < kernel_size; i++){
+        float tempI = input[idx + i];
+        float tempK = kernel[i];
+        temp += tempI * tempK;
+    }
+    output[idx] = temp;
+}
 
+// input, kernel, output are device pointers (i.e. pointers to memory on the GPU)
+extern "C" void solve(const float* input, const float* kernel, float* output, int input_size, int kernel_size) {
+    int output_size = input_size - kernel_size + 1;
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (output_size + threadsPerBlock - 1) / threadsPerBlock;
+
+    convolution_1d_kernel<<<blocksPerGrid, threadsPerBlock>>>(input, kernel, output, input_size, kernel_size);
+    //cudaDeviceSynchronize();
+}
+```
+0.82399 ms 62.5th percentile
+1维卷积。理解很难，动手写却很简单。
+
+> 向量化
+```cuda
+#include <cuda_runtime.h>
+__global__ void convolution_1d_kernel(const float* input, const float* kernel, float* output,
+                                      int input_size, int kernel_size) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx >= input_size - kernel_size + 1) return;
+    float temp = 0.0f;
+    #pragma unroll
+    for(int i = 0; i < kernel_size / 4; i++){
+        int p = i * 4;
+        float4 tempI = make_float4(input[idx + p], input[idx + p + 1], input[idx + p + 2], input[idx + p + 3]);
+        float4 tempK = make_float4(kernel[p], kernel[p + 1], kernel[p + 2], kernel[p + 3]);
+        temp += tempI.x * tempK.x + tempI.y * tempK.y + tempI.z * tempK.z + tempI.w * tempK.w ;
+    }
+    for(int i = kernel_size & ~3; i < kernel_size; i++ ){
+        float tempI = input[idx + i];
+        float tempK = kernel[i];
+        temp += tempI * tempK;
+    }
+    output[idx] = temp;
+}
+
+// input, kernel, output are device pointers (i.e. pointers to memory on the GPU)
+extern "C" void solve(const float* input, const float* kernel, float* output, int input_size, int kernel_size) {
+    int output_size = input_size - kernel_size + 1;
+    int threadsPerBlock = 1024;
+    int blocksPerGrid = (output_size + threadsPerBlock - 1) / threadsPerBlock;
+
+    convolution_1d_kernel<<<blocksPerGrid, threadsPerBlock>>>(input, kernel, output, input_size, kernel_size);
+    //cudaDeviceSynchronize();
+}
+```
+0.73152 ms 80.0th percentile
+这个向量化的独特处是，在单个线程的循环内做向量化而不是用更少线程数。
