@@ -484,6 +484,7 @@ extern "C" void solve(const float* input, const float* kernel, float* output, in
 }
 ```
 0.82399 ms 62.5th percentile
+
 1维卷积。理解很难，动手写却很简单。
 
 > 向量化
@@ -520,4 +521,5 @@ extern "C" void solve(const float* input, const float* kernel, float* output, in
 }
 ```
 0.73152 ms 80.0th percentile
+
 这个向量化的独特处是，在单个线程的循环内做向量化而不是用更少线程数。
