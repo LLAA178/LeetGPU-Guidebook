@@ -523,3 +523,89 @@ extern "C" void solve(const float* input, const float* kernel, float* output, in
 0.73152 ms 80.0th percentile
 
 这个向量化的独特处是，在单个线程的循环内做向量化而不是用更少线程数。
+
+> 共享内存
+```cuda
+#include <cuda_runtime.h>
+
+__global__ void conv1d_shared_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ kernel,
+    float* __restrict__ output,
+    int input_size, int kernel_size)
+{
+    const int out_size = input_size - kernel_size + 1;
+    const int out_start = blockIdx.x * blockDim.x;                  // 本 block 负责的输出起点（全局）
+    const int out_end   = min(out_start + blockDim.x, out_size);    // 本 block 负责的输出终点（开区间）
+
+    // 共享内存布局：[ 输入切片 (blockDim.x + K - 1) | kernel (K) ]
+    extern __shared__ float smem[];
+    float* s_in = smem;
+    float* s_k  = smem + (blockDim.x + kernel_size - 1);
+
+    // 这个 tile 对应的输入起点
+    const int tile_in_start = out_start; // valid 卷积时输入对齐输出
+    const int tile_in_len   = min(blockDim.x + kernel_size - 1, input_size - tile_in_start);
+
+    // 1) cooperative load: 输入切片 -> shared
+    #pragma unroll
+    for (int t = threadIdx.x; t < tile_in_len; t += blockDim.x) {
+        s_in[t] = input[tile_in_start + t];
+    }
+    #pragma unroll
+    // 2) cooperative load: kernel -> shared
+    for (int t = threadIdx.x; t < kernel_size; t += blockDim.x) {
+        s_k[t] = kernel[t];
+    }
+    __syncthreads();
+
+    // 3) 计算本线程的输出（若在有效范围内）
+    const int out_idx = out_start + threadIdx.x;
+    if (out_idx < out_end) {
+        // 在共享内存上做点积：s_in[threadIdx.x + j] * s_k[j]
+        float acc = 0.f;
+
+        // 手动 4-步展开（避免 float4 对齐问题，且适用于任意对齐的起点）
+        int j = 0;
+        #pragma unroll
+        for (; j + 3 < kernel_size; j += 4) {
+            float a0 = s_in[threadIdx.x + j + 0];
+            float a1 = s_in[threadIdx.x + j + 1];
+            float a2 = s_in[threadIdx.x + j + 2];
+            float a3 = s_in[threadIdx.x + j + 3];
+            float b0 = s_k[j + 0];
+            float b1 = s_k[j + 1];
+            float b2 = s_k[j + 2];
+            float b3 = s_k[j + 3];
+            acc += a0*b0 + a1*b1 + a2*b2 + a3*b3;
+        }
+        for (; j < kernel_size; ++j) {
+            acc += s_in[threadIdx.x + j] * s_k[j];
+        }
+
+        output[out_idx] = acc;
+    }
+}
+
+// input, kernel, output are device pointers
+extern "C" void solve(const float* input, const float* kernel, float* output,
+                      int input_size, int kernel_size)
+{
+    const int out_size = input_size - kernel_size + 1;
+    if (out_size <= 0) return;
+
+    const int threadsPerBlock = 1024;
+    const int blocksPerGrid   = (out_size + threadsPerBlock - 1) / threadsPerBlock;
+
+    // 共享内存大小 = 输入切片 + kernel
+    const size_t shmem_bytes =
+        (threadsPerBlock + kernel_size - 1 + kernel_size) * sizeof(float);
+
+    conv1d_shared_kernel<<<std::min(148*22,blocksPerGrid), threadsPerBlock, shmem_bytes>>>(
+        input, kernel, output, input_size, kernel_size);
+
+}
+```
+0.68818 ms 88.4th percentile
+
+把当前block输入和kernel都加载进共享内存，减少全局内存访问。
