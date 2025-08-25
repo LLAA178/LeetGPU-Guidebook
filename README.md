@@ -609,3 +609,123 @@ extern "C" void solve(const float* input, const float* kernel, float* output,
 0.68818 ms 88.4th percentile
 
 把当前block输入和kernel都加载进共享内存，减少全局内存访问。
+
+> 多级访存
+```cuda
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+#define BLOCK_THREADS 256
+#define THREAD_OUT    8
+#define MAX_K         4096
+
+__constant__ float ck[MAX_K];
+
+template<int BYTES>
+__device__ __forceinline__ void cp_async_smem_gmem(void* smem_dst, const void* gmem_src) {
+    uint32_t saddr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst)); // 32-bit shared addr
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], %2;\n" ::
+        "r"(saddr), "l"(gmem_src), "n"(BYTES)
+    );
+}
+
+__global__ void conv1d_bk_cpasync_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int input_size, int kernel_size)
+{
+    const int out_size = input_size - kernel_size + 1;
+    if (out_size <= 0) return;
+
+    const int out_per_blk = BLOCK_THREADS * THREAD_OUT;
+    const int out_blk_beg = blockIdx.x * out_per_blk;
+    if (out_blk_beg >= out_size) return;
+
+    // tile 输入覆盖 [out_blk_beg, out_blk_beg + out_per_blk + K - 1)
+    const int tile_in_start = out_blk_beg;
+    const int stage_elems   = out_per_blk + kernel_size - 1;
+    const int tile_in_len   = max(0, min(stage_elems, input_size - tile_in_start));
+
+    extern __shared__ float smem[];
+    float* s_in = smem;
+
+    // ===== 全覆盖装载：float4 协同 + 尾部标量 =====
+    const int vec_elems  = (tile_in_len & ~3);     // 4 对齐部分
+    const int vec_chunks = (vec_elems >> 2);       // float4 个数
+
+    // 关键修复：所有线程覆盖所有 chunk（不再按 warp 残缺分段）
+    for (int i = threadIdx.x; i < vec_chunks; i += BLOCK_THREADS) {
+        const char* gptr = reinterpret_cast<const char*>(input + tile_in_start) + i * 16;
+        char*       sptr = reinterpret_cast<char*>(s_in)                               + i * 16;
+        cp_async_smem_gmem<16>(sptr, gptr);
+    }
+    asm volatile("cp.async.commit_group;\n"::);
+    asm volatile("cp.async.wait_group 0;\n"::);
+
+    // 剩余 <4 元素用标量补齐
+    for (int t = vec_elems + threadIdx.x; t < tile_in_len; t += BLOCK_THREADS) {
+        s_in[t] = input[tile_in_start + t];
+    }
+    __syncthreads();
+
+    // ===== 计算：每线程 8 输出 =====
+    const int tlocal  = threadIdx.x * THREAD_OUT;
+    const int out_g0  = out_blk_beg + tlocal;
+    const int n_valid = max(0, min(THREAD_OUT, out_size - out_g0));
+    if (n_valid <= 0) return;
+
+    float acc[THREAD_OUT] = {0};
+
+    int j = 0;
+    for (; j + 3 < kernel_size; j += 4) {
+        float k0 = ck[j+0], k1 = ck[j+1], k2 = ck[j+2], k3 = ck[j+3];
+        #pragma unroll
+        for (int o = 0; o < THREAD_OUT; ++o) {
+            float a0 = s_in[tlocal + o + j + 0];
+            float a1 = s_in[tlocal + o + j + 1];
+            float a2 = s_in[tlocal + o + j + 2];
+            float a3 = s_in[tlocal + o + j + 3];
+            acc[o] += a0*k0 + a1*k1 + a2*k2 + a3*k3;  // 让编译器自由做 FMA/ILP
+        }
+    }
+    for (; j < kernel_size; ++j) {
+        float kj = ck[j];
+        #pragma unroll
+        for (int o = 0; o < THREAD_OUT; ++o) {
+            acc[o] += s_in[tlocal + o + j] * kj;
+        }
+    }
+
+    #pragma unroll
+    for (int o = 0; o < THREAD_OUT; ++o) {
+        if (o < n_valid) output[out_g0 + o] = acc[o];
+    }
+}
+
+extern "C" void solve(const float* __restrict__ input,
+                      const float* __restrict__ kernel,
+                      float* __restrict__ output,
+                      int input_size, int kernel_size)
+{
+    const int out_size = input_size - kernel_size + 1;
+    if (out_size <= 0) return;
+
+    // kernel 放常量内存（D2D）
+    cudaMemcpyToSymbol(ck, kernel, kernel_size * sizeof(float), 0, cudaMemcpyDeviceToDevice);
+
+    const int out_per_blk = BLOCK_THREADS * THREAD_OUT;
+    dim3 block(BLOCK_THREADS);
+    dim3 grid((out_size + out_per_blk - 1) / out_per_blk);
+
+    // 只用一份 tile 的 shared（无流水，简单稳）
+    size_t shmem_bytes = (size_t)(out_per_blk + kernel_size - 1) * sizeof(float);
+
+    conv1d_bk_cpasync_kernel<<<grid, block, shmem_bytes>>>(input, output, input_size, kernel_size);
+}
+```
+0.27392 ms 94.4th percentile
+
+- 常量显存，命中常量缓存并走广播时，延迟大致在 ~10–20 个周期（SM 级别）量级，且一次取数供一整个 warp，等效到“每线程”近似可忽略。
+- cp.async.cg.shared.global 中的 .cg 表示 cache global，只走 L2，不经过 L1。适合大块数据搬运（避免 L1 污染）。
+- 每个输入元素平均会被重复用 ~K 次。把它放到 shared 后，这些重复访问都变成了 SMEM 命中（单周期、超高带宽），极大降低了 DRAM/L2 读流量。
