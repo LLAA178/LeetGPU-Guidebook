@@ -729,3 +729,125 @@ extern "C" void solve(const float* __restrict__ input,
 - 常量显存，命中常量缓存并走广播时，延迟大致在 ~10–20 个周期（SM 级别）量级，且一次取数供一整个 warp，等效到“每线程”近似可忽略。
 - cp.async.cg.shared.global 中的 .cg 表示 cache global，只走 L2，不经过 L1。适合大块数据搬运（避免 L1 污染）。
 - 每个输入元素平均会被重复用 ~K 次。把它放到 shared 后，这些重复访问都变成了 SMEM 命中（单周期、超高带宽），极大降低了 DRAM/L2 读流量。
+
+### [reverse-array](https://leetgpu.com/challenges/reverse-array)
+> 基础版
+```cuda
+#include <cuda_runtime.h>
+
+__global__ void reverse_array(float* input, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx > N / 2) return;
+    int other_idx = N - 1 - idx;
+    float ta = input[idx];
+    float tb = input[other_idx];
+    input[idx] = tb;
+    input[other_idx] = ta;
+}
+```
+0.1115 ms 23.1th percentile
+
+经典双指针反转数组。
+
+> 共享内存
+```cuda
+#include <cuda_runtime.h>
+#define BLOCK_DIM 256
+__global__ void reverse_array(float* input, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx >= N) return;
+    __shared__ float copy_of_input[BLOCK_DIM];
+    copy_of_input[threadIdx.x] = input[idx];
+    __syncthreads();
+    input[N - 1 - idx] = copy_of_input[threadIdx.x];
+}
+
+// input is device pointer
+extern "C" void solve(float* input, int N) {
+    int threadsPerBlock = BLOCK_DIM;
+    int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+    reverse_array<<<blocksPerGrid, threadsPerBlock>>>(input, N);
+    //cudaDeviceSynchronize();
+}
+```
+0.08007 ms 69.2th percentile
+
+过共享内存做中转。
+
+### [relu](https://leetgpu.com/challenges/relu)
+```cuda
+__global__ void relu_kernel(const float* input, float* output, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx < N){
+        const float tmp = input[idx];
+        output[idx] = tmp > 0 ? tmp : 0;
+    }
+}
+```
+0.09597 ms 15.4th percentile
+
+常用激活函数之一，消灭负数。
+
+### [leaky-relu](https://leetgpu.com/challenges/leaky-relu)
+```cuda
+__global__ void leaky_relu_kernel(const float* input, float* output, int N) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx >= N)    return;
+    auto tmp = input[idx];
+    output[idx] = tmp >= 0 ? tmp : tmp * 0.01;
+}
+```
+0.18015 ms 6.7th percentile
+
+仁慈版relu。
+
+### [rainbow-table](https://leetgpu.com/challenges/rainbow-table)
+```cuda
+__global__ void fnv1a_hash_kernel(const int* input, unsigned int* output, int N, int R) {
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx>=N) return;
+    auto temp = input[idx];
+    while(R--){
+        temp = fnv1a_hash(temp);
+    }
+    output[idx] = temp;
+}
+```
+0.05202 ms 12.5th percentile
+
+### [matrix-copy](https://leetgpu.com/challenges/matrix-copy)
+```cuda
+extern "C" void solve(const float* A, float* B, const int N) {
+    cudaMemcpy(B, A, N*N*sizeof(float), cudaMemcpyDeviceToDevice);
+}
+```
+0.0381 ms 52.0th percentile
+
+### [count-array-element](https://leetgpu.com/challenges/count-array-element)
+```cuda
+__global__ void count_equal_kernel(const int* input, int* output, int N, int K) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= N) return;
+    int warp_num = 0;
+    warp_num += input[idx] == K;
+    for(int stride = warpSize / 2; stride > 0; stride /= 2)
+        warp_num += __shfl_down_sync(0xffffffff,warp_num,stride);
+    if(threadIdx.x % warpSize == 0) atomicAdd(output,warp_num);
+}
+```
+2.05445 ms 0.0th percentile
+
+### [count-2d-array-element](https://leetgpu.com/challenges/count-2d-array-element)
+```cuda
+__global__ void count_2d_equal_kernel(const int* input, int* output, int N, int M, int K) {
+    int col = blockDim.x * blockIdx.x + threadIdx.x;
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
+    if(col == 0 && row < N){
+        for(int i = 0; i < M; i++){
+            bool equal = input[row * M + i] == K ;
+            atomicAdd(output, equal);
+        }
+    }
+}
+```
+34.01452 ms 0.0th percentile
