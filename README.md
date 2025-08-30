@@ -853,7 +853,7 @@ __global__ void count_2d_equal_kernel(const int* input, int* output, int N, int 
 34.01452 ms 0.0th percentile
 
 ## 中等题
-#### [reduction](https://leetgpu.com/challenges/reduction)
+### [reduction](https://leetgpu.com/challenges/reduction)
 ```CUDA
 #include <cuda_runtime.h>
 #define BLOCK_SIZE 1024
@@ -895,4 +895,5 @@ extern "C" void solve(const float* input, float* output, int N) {
 }
 ```
 0.27248 ms 24.6th percentile
+
 分层归约
