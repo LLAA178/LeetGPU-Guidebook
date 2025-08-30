@@ -851,3 +851,48 @@ __global__ void count_2d_equal_kernel(const int* input, int* output, int N, int 
 }
 ```
 34.01452 ms 0.0th percentile
+
+## 中等题
+#### [reduction](https://leetgpu.com/challenges/reduction)
+```CUDA
+#include <cuda_runtime.h>
+#define BLOCK_SIZE 1024
+__global__ void reduction(const float* input, float* output, int N){
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    //1. copy to shared
+    //2. shared reduction
+    //3. warp reduction
+    //4. block sum
+    __shared__ float sharedMem[BLOCK_SIZE];
+    //拷到共享内存（越界用0），不能提前return
+    float v = (idx < N) ? input[idx] : 0.0f;
+    sharedMem[threadIdx.x] = v;
+    __syncthreads(); 
+
+    for(int stride = blockDim.x / 2; stride >= warpSize; stride /= 2){
+        if(threadIdx.x < stride){
+            sharedMem[threadIdx.x] += sharedMem[threadIdx.x + stride];
+        }
+        __syncthreads();    
+    }
+
+    if(threadIdx.x < warpSize){
+        float sum = sharedMem[threadIdx.x];          
+        unsigned mask = 0xffffffff;
+        sum += __shfl_down_sync(mask, sum, 16);
+        sum += __shfl_down_sync(mask, sum, 8);
+        sum += __shfl_down_sync(mask, sum, 4);
+        sum += __shfl_down_sync(mask, sum, 2);
+        sum += __shfl_down_sync(mask, sum, 1);
+        if(threadIdx.x == 0){
+            atomicAdd(output, sum);
+        }
+    }
+}
+// input, output are device pointers
+extern "C" void solve(const float* input, float* output, int N) {  
+    reduction<<<(N + BLOCK_SIZE - 1) / BLOCK_SIZE ,BLOCK_SIZE>>>(input, output, N);
+}
+```
+0.27248 ms 24.6th percentile
+分层归约
