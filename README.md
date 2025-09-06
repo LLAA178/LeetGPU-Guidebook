@@ -897,3 +897,185 @@ extern "C" void solve(const float* input, float* output, int N) {
 0.27248 ms 24.6th percentile
 
 分层归约
+
+### [softmax](https://leetgpu.com/challenges/softmax)
+> 天地同寿
+```cuda
+#include <cuda_runtime.h>
+#define BLOCK_SIZE 256
+#define UPPER_DIV(A, B) ((A + B - 1) / B)
+__global__ void block_max_kernel(const float* input, float* output, int N){
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    //same as reduction, but get max instead of sum
+    __shared__ float sharedMem[BLOCK_SIZE];
+    float v = (idx < N) ? input[idx] : 0.0f;
+    sharedMem[threadIdx.x] = v;
+    __syncthreads(); 
+
+    for(int stride = blockDim.x / 2; stride >= warpSize; stride /= 2){
+        if(threadIdx.x < stride){
+            sharedMem[threadIdx.x] = fmaxf(sharedMem[threadIdx.x], sharedMem[threadIdx.x + stride]);
+        }
+        __syncthreads();    
+    }
+
+    if(threadIdx.x < warpSize){
+        float blockMax = sharedMem[threadIdx.x];          
+        for(int stride = warpSize / 2; stride > 0; stride /= 2){
+            blockMax = fmaxf(blockMax, __shfl_down_sync(0xffffffff, blockMax, stride));
+        }
+        if(threadIdx.x == 0){
+            output[blockIdx.x] = blockMax;
+        }
+    }  
+}
+__global__ void softmax_kernel(const float* input, float* output, float* inputMax, double* expSum, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    __shared__ float sharedMem[BLOCK_SIZE];
+    float v = (idx < N) ? __expf(input[idx] - inputMax[0]) : 0.0f;
+    sharedMem[threadIdx.x] = v;
+    __syncthreads(); 
+
+    for(int stride = blockDim.x / 2; stride >= warpSize; stride /= 2){
+        if(threadIdx.x < stride){
+            sharedMem[threadIdx.x] += sharedMem[threadIdx.x + stride];
+        }
+        __syncthreads();    
+    }
+
+    if(threadIdx.x < warpSize){
+        float blockSum = sharedMem[threadIdx.x];          
+        for(int stride = warpSize / 2; stride > 0; stride /= 2){
+            blockSum += __shfl_down_sync(0xffffffff, blockSum, stride);
+        }
+        if(threadIdx.x == 0){
+            atomicAdd(expSum, blockSum);
+        }
+    }
+}
+__global__ void softmax_tail_kernel(const float* input, float* output, float* inputMax, double* expSum, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx >= N ) return;
+    auto sum = *expSum;
+    output[idx] = __expf(input[idx] - inputMax[0]) / sum;
+}
+
+// input, output are device pointers (i.e. pointers to memory on the GPU)
+extern "C" void solve(const float* input, float* output, int N) {
+    const int blocksPerGrid = UPPER_DIV(N, BLOCK_SIZE);
+    double *expSum;
+    float *blockMax;
+    cudaStream_t asyncStream;
+    cudaStreamCreate(&asyncStream);
+    cudaMallocAsync(&expSum, sizeof(double), asyncStream);
+    cudaMallocAsync(&blockMax, sizeof(float) * blocksPerGrid, asyncStream);
+    block_max_kernel<<<blocksPerGrid, BLOCK_SIZE, 0, asyncStream>>>(input, blockMax, N); 
+    int blocks = UPPER_DIV(blocksPerGrid, BLOCK_SIZE);
+    for(; blocks > 1 ; blocks = UPPER_DIV(blocks, BLOCK_SIZE)){
+        block_max_kernel<<<blocks, BLOCK_SIZE, 0, asyncStream>>>(blockMax, blockMax, N);    
+    }
+    softmax_kernel<<<blocksPerGrid, BLOCK_SIZE, 0, asyncStream>>>(input, output, blockMax, expSum, N);
+    softmax_tail_kernel<<<blocksPerGrid, BLOCK_SIZE, 0, asyncStream>>>(input, output, blockMax, expSum, N);
+    cudaFreeAsync(expSum, asyncStream);
+    cudaFreeAsync(blockMax, asyncStream);
+    cudaStreamDestroy(asyncStream);
+}
+```
+0.42211 ms 20.0th percentile
+
+乍一看和归约很相似，只是从求和变成求和+归一化。
+
+但是坑点在于，求和过程需要先求幂，而直接求幂则必然溢出，简单举例：e^1000能用浮点数表示吗？
+
+解决方法是：求出最大值，然后把所有input除以最大值再求幂。一来不影响结果，因为分子分母都除。二来不会溢出，因为e^-1000能用浮点数表示。
+
+流程变为求最值+求和+归一化。注意求最值和求和流程基本一样，只是atomicMax(float)没有实现，所以这里做了用循环blockMax替代。
+
+> 浮点原子化
+```cuda
+#include <cuda_runtime.h>
+#define BLOCK_SIZE 1024
+#define UPPER_DIV(A, B) ((A + B - 1) / B)
+__device__ float atomic_max_float(float *address, float val)
+{
+    int *address_as_int = (int *)address;
+    int old = *address_as_int, assumed;
+    do
+    {
+        assumed = old;
+        old = atomicCAS(address_as_int, assumed, __float_as_int(fmaxf(val, __int_as_float(assumed))));
+    } while (assumed != old);
+    return __int_as_float(old);
+}
+
+__global__ void max_kernel(const float* input, float* output, int N){
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    //same as reduction, but get max instead of sum
+    __shared__ float sharedMem[BLOCK_SIZE];
+    float v = (idx < N) ? input[idx] : 0.0f;
+    sharedMem[threadIdx.x] = v;
+    __syncthreads(); 
+
+    for(int stride = blockDim.x / 2; stride >= warpSize; stride /= 2){
+        if(threadIdx.x < stride){
+            sharedMem[threadIdx.x] = fmaxf(sharedMem[threadIdx.x], sharedMem[threadIdx.x + stride]);
+        }
+        __syncthreads();    
+    }
+
+    if(threadIdx.x < warpSize){
+        float blockMax = sharedMem[threadIdx.x];          
+        for(int stride = warpSize / 2; stride > 0; stride /= 2){
+            blockMax = fmaxf(blockMax, __shfl_down_sync(0xffffffff, blockMax, stride));
+        }
+        if(threadIdx.x == 0){
+            atomic_max_float(output, blockMax);
+        }
+    }  
+}
+__global__ void softmax_kernel(const float* input, float* output, float* inputMax, float* expSum, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    __shared__ float sharedMem[BLOCK_SIZE];
+    float v = (idx < N) ? __expf(input[idx] - *inputMax) : 0.0f;
+    sharedMem[threadIdx.x] = v;
+    __syncthreads(); 
+
+    for(int stride = blockDim.x / 2; stride >= warpSize; stride /= 2){
+        if(threadIdx.x < stride){
+            sharedMem[threadIdx.x] += sharedMem[threadIdx.x + stride];
+        }
+        __syncthreads();    
+    }
+
+    if(threadIdx.x < warpSize){
+        float blockSum = sharedMem[threadIdx.x];          
+        for(int stride = warpSize / 2; stride > 0; stride /= 2){
+            blockSum += __shfl_down_sync(0xffffffff, blockSum, stride);
+        }
+        if(threadIdx.x == 0){
+            atomicAdd(expSum, blockSum);
+        }
+    }
+}
+__global__ void softmax_tail_kernel(const float* input, float* output, float* inputMax, float* expSum, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if(idx >= N ) return;
+    auto sum = *expSum;
+    output[idx] = __expf(input[idx] - *inputMax) / sum;
+}
+
+// input, output are device pointers (i.e. pointers to memory on the GPU)
+extern "C" void solve(const float* input, float* output, int N) {
+    const int blocksPerGrid = UPPER_DIV(N, BLOCK_SIZE);
+    float *expSum;
+    float *inputMax;
+    cudaMallocAsync(&expSum, sizeof(float), cudaStreamDefault);
+    cudaMallocAsync(&inputMax, sizeof(float), cudaStreamDefault);
+    max_kernel<<<blocksPerGrid, BLOCK_SIZE, 0, cudaStreamDefault>>>(input, inputMax, N); 
+    softmax_kernel<<<blocksPerGrid, BLOCK_SIZE, 0, cudaStreamDefault>>>(input, output, inputMax, expSum, N);
+    softmax_tail_kernel<<<blocksPerGrid, BLOCK_SIZE, 0, cudaStreamDefault>>>(input, output, inputMax, expSum, N);
+}
+```
+0.0305 ms 88.6th percentile
+
+使用atomicCAS实现了atomicMax(float)，与归约保持一致。
