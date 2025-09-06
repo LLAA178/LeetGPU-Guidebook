@@ -854,6 +854,7 @@ __global__ void count_2d_equal_kernel(const int* input, int* output, int N, int 
 
 ## 中等题
 ### [reduction](https://leetgpu.com/challenges/reduction)
+> 分层归约
 ```CUDA
 #include <cuda_runtime.h>
 #define BLOCK_SIZE 1024
@@ -896,7 +897,186 @@ extern "C" void solve(const float* input, float* output, int N) {
 ```
 0.27248 ms 24.6th percentile
 
-分层归约
+> sweet spot
+```cuda
+#include <cuda_runtime.h>
+
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
+#define FULL_MASK 0xffffffffu
+
+__inline__ __device__ float warp_reduce_sum(float v) {
+    v += __shfl_down_sync(FULL_MASK, v, 16);
+    v += __shfl_down_sync(FULL_MASK, v, 8);
+    v += __shfl_down_sync(FULL_MASK, v, 4);
+    v += __shfl_down_sync(FULL_MASK, v, 2);
+    v += __shfl_down_sync(FULL_MASK, v, 1);
+    return v;
+}
+
+template<int BS>
+__global__ void reduce_limit_blocks(const float* __restrict__ x,
+                                    float* __restrict__ out,
+                                    int n) {
+    __shared__ float smem[BS];
+    const int tid   = threadIdx.x;
+    const int bid   = blockIdx.x;
+    const int gsize = gridDim.x * (BS * 2);   // 2x 展开
+    int i = bid * (BS * 2) + tid;
+
+    // 线程本地累加（两元素/线程）
+    float sum = 0.f;
+    if (i < n)              sum += x[i];
+    if (i + BS < n)         sum += x[i + BS];
+
+    // grid-stride 回合也按 2x 展开
+    for (i += gsize; i < n; i += gsize) {
+        sum += x[i];
+        if (i + BS < n) sum += x[i + BS];
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    // block 内规约（到 32 停）
+    #pragma unroll
+    for (int s = BS / 2; s >= 32; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+
+    // warp 规约
+    if (tid < 32) {
+        float v = smem[tid];
+        v = warp_reduce_sum(v);
+        if (tid == 0) atomicAdd(out, v);
+    }
+}
+
+extern "C" void solve(const float* input, float* output, int N) {
+    // 设备信息
+    int dev = 0, sm = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
+
+    // 自然网格（两元素/线程）
+    int natural = (N + (BLOCK_SIZE * 2) - 1) / (BLOCK_SIZE * 2);
+
+    // 关键：限制但别太小。经验：SM * 6~10 比较稳
+    int grid = sm * 8;
+    if (natural < grid) grid = natural;
+    if (grid < 1) grid = 1;
+
+    reduce_limit_blocks<BLOCK_SIZE><<<grid, BLOCK_SIZE>>>(input, output, N);
+}
+```
+0.05636 ms 60.0th percentile
+
+限制block数 + 双元素读写 + 精心设计参数，吃到了带宽甜点位。
+> 双层旋风
+```cuda
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256   // 可试 128/192/320 做 AB
+#endif
+
+#define FULL_MASK 0xffffffffu
+
+__inline__ __device__ float warp_reduce_sum(float v) {
+    v += __shfl_down_sync(FULL_MASK, v, 16);
+    v += __shfl_down_sync(FULL_MASK, v, 8);
+    v += __shfl_down_sync(FULL_MASK, v, 4);
+    v += __shfl_down_sync(FULL_MASK, v, 2);
+    v += __shfl_down_sync(FULL_MASK, v, 1);
+    return v;
+}
+
+template<int BS>
+__global__ void reduce_fast(const float* __restrict__ x,
+                            float* __restrict__ out,
+                            int n) {
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int warp_id  = tid >> 5;             // 0..(BS/32-1)
+    const int warps    = BS / 32;
+
+    float sum = 0.f;
+
+    // -------- 向量化主循环：float4 + 2× 展开 => 每迭代处理 8 个元素/线程 --------
+    const bool aligned16 = ((reinterpret_cast<uintptr_t>(x) & 15u) == 0);
+    if (aligned16) {
+        const int n4 = n >> 2;                 // 以 float4 计
+        const float4* __restrict__ v = reinterpret_cast<const float4*>(x);
+
+        int j = blockIdx.x * BS + tid;         // 每线程一个向量索引
+        const int stride4 = gridDim.x * BS;
+
+        // 每回合拿两组：j 与 j+stride4（手动 2× 展开）
+        for (; j < n4; j += (stride4 << 1)) {
+            float4 a = v[j];
+            sum += a.x + a.y + a.z + a.w;
+
+            int j2 = j + stride4;
+            if (j2 < n4) {
+                float4 b = v[j2];
+                sum += b.x + b.y + b.z + b.w;
+            }
+        }
+
+        // 处理 4 对齐剩余的尾巴（0~3 个），仍用 grid-stride
+        int base = n4 << 2;
+        for (int i = base + blockIdx.x * BS + tid; i < n; i += gridDim.x * BS) {
+            sum += x[i];
+        }
+    } else {
+        // 非 16B 对齐：回退到标量 2× 展开
+        const int gsize = gridDim.x * (BS * 2);
+        int i = blockIdx.x * (BS * 2) + tid;
+        if (i < n)       sum += x[i];
+        if (i + BS < n)  sum += x[i + BS];
+        for (i += gsize; i < n; i += gsize) {
+            sum += x[i];
+            if (i + BS < n) sum += x[i + BS];
+        }
+    }
+
+    // -------- 纯 warp 规约 + 仅一次同步 --------
+    sum = warp_reduce_sum(sum);
+
+    __shared__ float smem[BS / 32];            // 每个 warp 一个槽
+    if (lane == 0) smem[warp_id] = sum;
+    __syncthreads();                           // 仅此一次
+
+    // 由 warp0 做最后规约
+    float block_sum = 0.f;
+    if (warp_id == 0) {
+        block_sum = (tid < warps) ? smem[lane] : 0.f;
+        block_sum = warp_reduce_sum(block_sum);
+        if (lane == 0) atomicAdd(out, block_sum);
+    }
+}
+
+extern "C" void solve(const float* input, float* output, int N) {
+    int dev = 0, sm = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
+
+    // grid 适度加大以饱和带宽。经验：SM * 10~12 往往比 *8 更满
+    int natural = (N + (BLOCK_SIZE * 8) - 1) / (BLOCK_SIZE * 8); // 估算向量化吞吐
+    int grid = sm * 12;
+    if (natural > 0) grid = min(grid, natural);
+    if (grid < 1) grid = 1;
+
+    // 若调用方没清零，这里别清。确保测试基准一致
+    reduce_fast<BLOCK_SIZE><<<grid, BLOCK_SIZE>>>(input, output, N);
+}
+```
+0.04402 ms 98.7th percentile
+
+两级warp归约 + 一次同步，避免了shared频繁读写。向量化。
 
 ### [softmax](https://leetgpu.com/challenges/softmax)
 > 天地同寿
