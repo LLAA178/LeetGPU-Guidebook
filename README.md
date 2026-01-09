@@ -46,7 +46,7 @@ __global__ void vector_add4(const float4* A, const float4* B, float* C, int N) {
 // A, B, C are device pointers (i.e. pointers to memory on the GPU)
 extern "C" void solve(const float* A, const float* B, float* C, int N) {
     int threadsPerBlock = 256;
-    int blocksPerGrid = (N / 4 + threadsPerBlock - 1) / threadsPerBlock;
+    int blocksPerGrid = ((N+3) / 4 + threadsPerBlock - 1) / threadsPerBlock;
     const float4* A4 = reinterpret_cast<const float4*>(A);
     const float4* B4 = reinterpret_cast<const float4*>(B);
     vector_add4<<<blocksPerGrid, threadsPerBlock>>>(A4, B4, C, N);
