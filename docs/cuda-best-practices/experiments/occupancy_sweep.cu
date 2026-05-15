@@ -34,6 +34,7 @@ __global__ void occupancy_sweep_kernel(
     int n,
     int iters,
     int smem_floats) {
+  // The sweep keeps the instruction stream fixed and only changes residency.
   extern __shared__ float smem[];
 
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -222,6 +223,8 @@ void run_variant(
                 << extra_smem_bytes << ' '
                 << total_smem_bytes << ' '
                 << active_blocks_per_sm << ' '
+                << active_warps << ' '
+                << max_warps << ' '
                 << theoretical_occupancy << ' '
                 << avg_ms << ' '
                 << max_abs_error << ' '
@@ -269,7 +272,8 @@ int main() {
   std::cout << "max_threads_per_sm: " << prop.maxThreadsPerMultiProcessor << '\n';
   std::cout << "warp_size: " << prop.warpSize << '\n';
   std::cout << "variant block_size regs_per_thread local_bytes_per_thread extra_smem_bytes total_smem_bytes"
-            << " active_blocks_per_sm theoretical_occupancy kernel_ms max_abs_error check"
+            << " active_blocks_per_sm active_warps_per_sm max_warps_per_sm theoretical_occupancy"
+            << " kernel_ms max_abs_error check"
             << '\n';
 
   run_variant<4>("low_regs", device_in, device_out, host_in, prop, stream, start, stop);

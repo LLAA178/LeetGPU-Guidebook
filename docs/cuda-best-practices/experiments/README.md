@@ -474,6 +474,13 @@ nvcc -O3 -std=c++17 occupancy_sweep.cu -o occupancy_sweep
 | extra_smem_bytes | 0 / 4KB / 8KB / 16KB / 32KB |
 | occupancy 指标 | `cudaOccupancyMaxActiveBlocksPerMultiprocessor` 计算的单 SM 理论 occupancy |
 
+先把定义钉死：
+
+- `occupancy` 是单个 SM 上“活跃 warp 数 / 硬件允许的最大活跃 warp 数”。
+- 它的作用不是直接减少某条指令的 latency，而是给 warp scheduler 更多可切换对象，用来隐藏 memory latency 和长依赖链 latency。
+- 所以 occupancy 更像“延迟隐藏预算”，不是性能本身。高 occupancy 说明“有条件切换更多 warp”，不说明“每个 warp 的指令一定更高效”。
+- 当前这份 `occupancy_sweep.cu` 打印的是理论 occupancy，不是 profiler 里的实际活跃度；它回答的是“资源上限允许多少 warp 驻留”，不是“运行时每拍到底有多少 ready warp”。
+
 实验记录：
 
 ![Occupancy sweep kernel vs shared memory](./assets/occupancy-sweep-kernel-vs-shared-mem.png)
@@ -484,20 +491,67 @@ nvcc -O3 -std=c++17 occupancy_sweep.cu -o occupancy_sweep
 
 ![Occupancy sweep occupancy vs block size](./assets/occupancy-sweep-occupancy-vs-block-size.png)
 
-预期：
+这个实验该怎么用：
 
-- `extra_smem_bytes` 增大时，先压低单 SM 理论 occupancy，再拉长 `kernel_ms`；`block_size` 的影响相对次要。
+- 这组 sweep 适合回答“当 shared memory / registers 把可驻留 warp 数压低以后，耗时会不会开始上升”。
+- 它不适合单独回答“occupancy 和耗时一定是什么函数关系”，因为真实性能还受每 warp 指令延迟、内存访问、ILP、发射效率影响。
+- 也不应把 “occupancy 高” 直接翻译成 “一定更快”。这正是下面 `Branch / Scheduler` 章节存在的原因。
 
 结论：
 
-- `low_regs` 下，`block_size=64/128/256/512` 且 occupancy 接近 `1.0` 时，`kernel_ms` 基本稳定在 `0.286~0.290 ms`，说明单改 `block_size` 几乎没有收益。
-- `extra_smem_bytes=32KB` 时，`low_regs, block=64` 从 `0.290 ms / 1.000` 变成 `0.573 ms / 0.125`；`mid_regs, block=64` 从 `1.883 ms / 0.625` 变成 `2.160 ms / 0.125`，说明 shared memory 通过压低 occupancy 明显拉长耗时。
-- `mid_regs=44 regs/thread` 已经把这台 A100 上的理论 occupancy 压到 `0.625` 或 `0.500`，同时把 `kernel_ms` 整体抬到 `1.84~2.16 ms`，说明这组 kernel 已经进入明显的 register-limited occupancy 区间。
+- `low_regs` 下，`block_size=64/128/256/512` 且 occupancy 接近 `1.0` 时，`kernel_ms` 基本稳定在 `0.286~0.290 ms`。这说明一旦可驻留 warp 已经够多，再单纯把 block size 调来调去，收益非常有限。
+- `extra_smem_bytes=32KB` 时，`low_regs, block=64` 从 `0.290 ms / 1.000` 变成 `0.573 ms / 0.125`；`mid_regs, block=64` 从 `1.883 ms / 0.625` 变成 `2.160 ms / 0.125`。更合理的读法是：occupancy 掉到很低以后，warp 不够切，长延迟更难被遮掉，所以时间明显变差。
+- `mid_regs=44 regs/thread` 已经把这台 A100 上的理论 occupancy 压到 `0.625` 或 `0.500`，同时把 `kernel_ms` 整体抬到 `1.84~2.16 ms`。这能证明“寄存器压力会限制驻留并发”，但不能证明“时间上涨全部由 occupancy 决定”。
 
 原始数据：
 
 - [`occupancy-sweep-data.txt`](./assets/occupancy-sweep-data.txt)
 - [`render_occupancy_sweep_plots.py`](./render_occupancy_sweep_plots.py)
+
+## Occupancy × ILP Matrix
+
+当前实验使用 [`occupancy_ilp_matrix.cu`](./occupancy_ilp_matrix.cu)。
+
+运行命令：
+
+```bash
+nvcc -O3 -std=c++17 occupancy_ilp_matrix.cu -o occupancy_ilp_matrix
+./occupancy_ilp_matrix
+```
+
+这个实验专门做两件事：
+
+- `dep_chain / ilp2 / ilp4` 固定每轮总 FMA 数，分别把 4 条依赖链压成 1 / 2 / 4 条独立链，用来验证 ILP 的影响。
+- `extra_smem_bytes` 继续压低 occupancy，用来观察 occupancy 降低后，低 ILP kernel 是否更先掉速。
+
+实验记录：
+
+![Occupancy ILP matrix kernel vs shared memory](./assets/occupancy-ilp-matrix-kernel-vs-shared-mem.png)
+
+![Occupancy ILP matrix occupancy vs shared memory](./assets/occupancy-ilp-matrix-occupancy-vs-shared-mem.png)
+
+![Occupancy ILP matrix kernel vs ILP](./assets/occupancy-ilp-matrix-kernel-vs-ilp.png)
+
+![Occupancy ILP matrix speedup vs ILP](./assets/occupancy-ilp-matrix-speedup-vs-ilp.png)
+
+代表性结果：
+
+| variant | extra_smem_bytes | theoretical_occupancy | kernel_ms | speedup_vs_dep_0KB |
+| --- | --- | --- | --- | --- |
+| `dep_chain` | 0 | 1.000 | 0.348 | 1.000 |
+| `ilp2` | 0 | 1.000 | 0.339 | 1.025 |
+| `ilp4` | 0 | 1.000 | 0.330 | 1.053 |
+| `dep_chain` | 32768 | 0.500 | 0.384 | 0.906 |
+| `ilp2` | 32768 | 0.500 | 0.363 | 0.960 |
+| `ilp4` | 32768 | 0.500 | 0.335 | 1.040 |
+
+结论：
+
+- 在 `1.0 occupancy` 下，`dep_chain -> ilp2 -> ilp4` 的 `kernel_ms` 依次从 `0.348 -> 0.339 -> 0.330 ms` 下降，说明在总 FMA 数对齐时，单 warp 内的独立指令链越多，吞吐越高。
+- 把 occupancy 压到 `0.5` 以后，`dep_chain` 从 `0.348 ms` 变成 `0.384 ms`，约慢 `10.3%`；`ilp4` 只从 `0.330 ms` 变成 `0.335 ms`，约慢 `1.5%`。这说明 occupancy 降低后，低 ILP kernel 更容易暴露长依赖链 latency。
+- 同样在 `0.5 occupancy` 下，`ilp4` 仍然比 `dep_chain` 快，`0.335 ms` 对 `0.384 ms`，约快 `1.15x`。这说明“50% occupancy 但 ILP 更好”的 kernel，完全可能快过“100% occupancy 但指令链更差”的版本。
+
+建议把这组结果和 `scheduler_latency_hiding` 放在一起看，因为前者负责“固定总指令数，改 ILP 形状”，后者负责“在更低 occupancy 下，ILP 为什么更重要”。
 
 ## Instruction Optimization
 

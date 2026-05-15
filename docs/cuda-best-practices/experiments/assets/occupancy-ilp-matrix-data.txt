@@ -1,0 +1,22 @@
+device: NVIDIA A100 80GB PCIe
+num_elems: 1048576
+iters: 256
+repeats: 5
+block_size: 256
+sm_count: 108
+max_threads_per_sm: 2048
+warp_size: 32
+variant extra_smem_bytes regs_per_thread local_bytes_per_thread active_blocks_per_sm active_warps_per_sm max_warps_per_sm theoretical_occupancy kernel_ms speedup_vs_dep_0KB max_abs_error check
+experiment: occupancy_ilp_matrix
+dep_chain 0 16 0 8 64.000 64.000 1.000 0.348 1.000 0.000 PASS
+dep_chain 8192 16 0 8 64.000 64.000 1.000 0.348 1.001 0.000 PASS
+dep_chain 16384 16 0 8 64.000 64.000 1.000 0.347 1.001 0.000 PASS
+dep_chain 32768 16 0 4 32.000 64.000 0.500 0.384 0.906 0.000 PASS
+ilp2 0 16 0 8 64.000 64.000 1.000 0.339 1.025 0.000 PASS
+ilp2 8192 16 0 8 64.000 64.000 1.000 0.339 1.026 0.000 PASS
+ilp2 16384 16 0 8 64.000 64.000 1.000 0.339 1.026 0.000 PASS
+ilp2 32768 16 0 4 32.000 64.000 0.500 0.363 0.960 0.000 PASS
+ilp4 0 15 0 8 64.000 64.000 1.000 0.330 1.053 0.000 PASS
+ilp4 8192 15 0 8 64.000 64.000 1.000 0.330 1.053 0.000 PASS
+ilp4 16384 15 0 8 64.000 64.000 1.000 0.331 1.053 0.000 PASS
+ilp4 32768 15 0 4 32.000 64.000 0.500 0.335 1.040 0.000 PASS

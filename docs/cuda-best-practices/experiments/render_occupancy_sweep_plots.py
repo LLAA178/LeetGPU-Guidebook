@@ -3,7 +3,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 
-ASSET_DIR = Path("docs/cuda-best-practices/experiments/assets")
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
 DATA_PATH = ASSET_DIR / "occupancy-sweep-data.txt"
 
 VARIANTS = ["low_regs", "mid_regs"]
@@ -62,7 +62,7 @@ def parse_rows():
         ):
             continue
         parts = line.split()
-        if len(parts) != 11:
+        if len(parts) != 13:
             continue
         rows.append(
             {
@@ -70,8 +70,11 @@ def parse_rows():
                 "block_size": int(parts[1]),
                 "regs_per_thread": int(parts[2]),
                 "extra_smem_bytes": int(parts[4]),
-                "theoretical_occupancy": float(parts[7]),
-                "kernel_ms": float(parts[8]),
+                "active_blocks_per_sm": float(parts[6]),
+                "active_warps_per_sm": float(parts[7]),
+                "max_warps_per_sm": float(parts[8]),
+                "theoretical_occupancy": float(parts[9]),
+                "kernel_ms": float(parts[10]),
             }
         )
     return rows
