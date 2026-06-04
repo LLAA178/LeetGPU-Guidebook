@@ -1932,7 +1932,6 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 ## 困难题
 
 ### [multi-head-attention](https://leetgpu.com/challenges/multi-head-attention)
-*环境: CUDA*
 
 这题可以先从 **Multi-Head Attention** 的三个核心阶段入手：`Q @ K^T`、`softmax`、`P @ V`。把这三步拆清楚之后，再看哪些维度值得分块、哪些数据值得搬进 shared memory 复用，整体思路就会顺很多。
 
@@ -1974,6 +1973,7 @@ __global__ void mha_kernel(const float* Q,
   ...
 }
 ```
+10.94 ms 36.4th (A100)
 
 这版映射很直接：
 
@@ -2020,6 +2020,7 @@ __global__ void flash_attn_small_kernel(const float* Q,
   // normalize with running_sum and write output
 }
 ```
+1.51 ms 95.5th (A100)
 
 这一版的重点在于把分块逻辑真正落到 kernel 映射里，而不只是把实现换成一个 FlashAttention 风格的名字。
 
