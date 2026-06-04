@@ -13,8 +13,8 @@
 
 | 简单题 | 中等题 | 困难题 |
 | --- | --- | --- |
-| [vector-addition](#vector-addition) | [reduction](#reduction) | [gpt-2-transformer-block](#gpt-2-transformer-block) |
-| [matrix-multiplication](#matrix-multiplication) | [softmax](#softmax) |  |
+| [vector-addition](#vector-addition) | [reduction](#reduction) | [multi-head-attention](#multi-head-attention) |
+| [matrix-multiplication](#matrix-multiplication) | [softmax](#softmax) | [gpt-2-transformer-block](#gpt-2-transformer-block) |
 | [matrix-transpose](#matrix-transpose) | [dot-product](#dot-product) |  |
 | [color-inversion](#color-inversion) | [parallel-merge](#parallel-merge) |  |
 | [1d-convolution](#1d-convolution) | [int8-quantized-matmul](#int8-quantized-matmul) |  |
@@ -1930,6 +1930,153 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 完整代码：[`solutions/quantization/weight-dequantization.cu`](./solutions/quantization/weight-dequantization.cu)
 
 ## 困难题
+
+### [multi-head-attention](https://leetgpu.com/challenges/multi-head-attention)
+*环境: CUDA*
+
+这题可以先从 **Multi-Head Attention** 的三个核心阶段入手：`Q @ K^T`、`softmax`、`P @ V`。把这三步拆清楚之后，再看哪些维度值得分块、哪些数据值得搬进 shared memory 复用，整体思路就会顺很多。
+
+> baseline
+```cuda
+__global__ void mha_kernel(const float* Q,
+                           const float* K,
+                           const float* V,
+                           float* output,
+                           int N,
+                           int d_model,
+                           int h) {
+  int head_size = d_model / h;
+  int q_row = blockIdx.x;
+  int head_idx = blockIdx.y;
+  int tid = threadIdx.x;
+
+  extern __shared__ float shared_mem[];
+  float* scores = shared_mem;
+  float* q_vec = scores + N;
+
+  // load one query row for this head
+  for (int dim = tid; dim < head_size; dim += blockDim.x) {
+    q_vec[dim] = Q[q_row * d_model + head_idx * head_size + dim];
+  }
+  __syncthreads();
+
+  // compute the whole score row
+  for (int k_row = tid; k_row < N; k_row += blockDim.x) {
+    float dot = 0.0f;
+    for (int dim = 0; dim < head_size; ++dim) {
+      dot += q_vec[dim] * K[k_row * d_model + head_idx * head_size + dim];
+    }
+    scores[k_row] = dot * rsqrtf(float(head_size));
+  }
+  __syncthreads();
+
+  // softmax + weighted sum over V
+  ...
+}
+```
+
+这版映射很直接：
+
+- 一个 block 处理一个 `(query row, head)`。
+- 先把当前 query 的一整行 head 向量放进 shared memory，避免后面每个 key 都重复读 Q。
+- 再把长度为 `N` 的整行 score 算出来，做 softmax，最后拿权重去乘 `V`。
+
+它的好处是非常好讲，也非常容易对拍。缺点也很明显：
+
+- 同一个 block 要完整扫一遍 `N` 个 key。
+- score 行需要先全部落到 shared memory，再做 softmax。
+- `K` 和 `V` 的 tile 复用还不够积极。
+
+> optimized
+```cuda
+template <int kWarpRows>
+__global__ void flash_attn_small_kernel(const float* Q,
+                                        const float* K,
+                                        const float* V,
+                                        float* output,
+                                        int N,
+                                        int d_model,
+                                        int head_size,
+                                        float scale) {
+  int tx = threadIdx.x;              // lane inside a warp
+  int ty = threadIdx.y;              // warp index inside a block
+  int q_row = blockIdx.x * kWarpRows + ty;
+  int head_offset = blockIdx.y * head_size;
+
+  __shared__ float sQ[kWarpRows][33];
+  __shared__ float sK[32][33];
+  __shared__ float sP[kWarpRows][33];
+
+  float output_local[4] = {0.0f};
+  float running_max = -INFINITY;
+  float running_sum = 0.0f;
+
+  for (int kv_block = 0; kv_block < (N + 31) / 32; ++kv_block) {
+    // load tiled Q/K, compute one 32-key score block
+    // warp_allreduce_max / warp_allreduce_sum for online softmax
+    // reuse shared memory again as V tile and accumulate P @ V
+  }
+
+  // normalize with running_sum and write output
+}
+```
+
+这一版的重点在于把分块逻辑真正落到 kernel 映射里，而不只是把实现换成一个 FlashAttention 风格的名字。
+
+先看 block 怎么切：
+
+- `blockIdx.y` 仍然对应 head。
+- `blockIdx.x` 不再只对应一个 query row，而是对应一小组 query row。
+- block 内每个 warp 负责一行 query，所以同一个 block 可以同时处理多行 Q。
+
+这样切的目的，是让一个 block 读进来的 `K/V` tile 能被多个 query row 复用，让同一份 tile 服务多行 query。
+
+再看两层 tile：
+
+1. `N` 维按 32 个 key/value 切块。  
+这表示每一轮只处理 `32` 个 key。当前这 `32` 个 key 的 `K` 和 `V` 会先搬进 shared memory，再被 block 内多个 warp 复用。
+
+2. `head_size` 维也按 32 列切块。  
+因为一个 warp 正好是 32 个 lane，最自然的做法就是让 lane 直接对应 tile 内的一列。比如 `head_size = 128` 时，会被拆成 4 个 `32`-wide 子块，逐块做乘加。
+
+这两个维度一起切，kernel 里实际做的是：
+
+- 外层循环扫 `kv_block`，每次处理 `32` 个 key。
+- 内层循环扫 `d_k tile`，每次处理 `32` 个 head 维度。
+- 同一个 warp 的 32 个 lane，一起把“当前 query 对当前 32 个 key 的 score”算出来。
+
+online softmax 是这套分块能成立的关键。因为我们不想把整行 `N` 个 score 全存下来再做 softmax，而是希望处理完一个 `32-key` 块，就把这一块的信息合并进全局结果。所以每个 warp 持续维护两份状态：
+
+- `running_max`：到当前为止见过的最大 score
+- `running_sum`：在这个最大值基准下累计的 `exp` 和
+
+当前 tile 的 score 算出来后：
+
+- 先用 `warp_allreduce_max` 求出这 32 个 score 的最大值。
+- 再用 `warp_allreduce_sum` 求出这 32 个 `exp(score - new_max)` 的和。
+- 然后把历史累计结果按 `alpha = exp(old_max - new_max)` 统一重标定，再把新块加进去。
+
+这里一定要用 **all-reduce**，不能用只让 `lane0` 正确的 down-reduce。因为 online softmax 里每个 lane 后续都还要继续参与自己的输出列累加，所以所有 lane 都必须拿到同一个 `max` 和 `sum`。
+
+`P @ V` 这一步也复用了同一块 shared memory：
+
+- 前半段 `sK` 存的是 `K` tile，用来算 score。
+- score 和 softmax 做完后，`sK` 这块空间立刻改存 `V` tile。
+- `sP` 里已经放好了当前 32 个 key 的概率权重，于是每个 lane 直接做一段长度为 32 的加权和，累加到 `output_local`。
+
+当前实现的调度策略是：
+
+- `head_size <= 128`：走专门化 small-kernel。
+- `head_size > 128`：走通用 fallback kernel，优先保证题目全范围都能覆盖。
+- `head_size <= 64` 时一个 block 放 8 个 warp；`head_size = 128` 时一个 block 放 4 个 warp，给更宽的头留出更多共享内存和寄存器余量。
+
+所以这题更值得单独看的，是下面三件事怎样一起配合起来：
+
+- `(query row, head)` 怎么映射到 warp / block
+- `N` 和 `head_size` 两个维度为什么都要切 tile
+- online softmax 怎么把“分块处理 score”变成合法的整体 softmax
+
+完整代码：[`solutions/transformer/multi-head-attention.cu`](./solutions/transformer/multi-head-attention.cu)
 
 ### [gpt-2-transformer-block](https://leetgpu.com/challenges/gpt-2-transformer-block)
 
