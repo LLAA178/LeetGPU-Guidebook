@@ -25,6 +25,7 @@
 | [matrix-copy](#matrix-copy) |  |  |
 | [count-array-element](#count-array-element) |  |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
+| [value-clipping](#value-clipping) |  |  |
 
 ## 简单题
 ### [vector-addition](https://leetgpu.com/challenges/vector-addition)
@@ -873,6 +874,53 @@ __global__ void count_2d_equal_kernel(const int* input, int* output, int N, int 
 }
 ```
 34.01452 ms 0.0th percentile (B200)
+
+### [value-clipping](https://leetgpu.com/challenges/value-clipping)
+*环境: CUDA*
+
+> baseline
+```CUDA
+__global__ void clip_kernel(const float* input, float* output, float lo, float hi, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= N) return;
+
+    float out = input[idx] > lo ? input[idx] : lo;
+    output[idx] = out < hi ? out : hi;
+}
+```
+
+每个线程处理一个元素，连续读取输入并连续写回输出；该逐元素操作主要受显存带宽限制。
+
+> vectorized
+```CUDA
+__global__ void clip_kernel(const float* input, float* output, float lo, float hi, int N) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx > N / 4) return;
+
+    if (idx == N / 4) {
+        for (int i = 0; i < N % 4; i++) {
+            float tmp = input[idx * 4 + i];
+            float out = tmp > lo ? tmp : lo;
+            out = out < hi ? out : hi;
+            output[idx * 4 + i] = out;
+        }
+    } else if (idx < N / 4) {
+        const float4 tmp = reinterpret_cast<const float4*>(input)[idx];
+        float4 out;
+        out.x = tmp.x > lo ? tmp.x : lo;
+        out.x = out.x < hi ? out.x : hi;
+        out.y = tmp.y > lo ? tmp.y : lo;
+        out.y = out.y < hi ? out.y : hi;
+        out.z = tmp.z > lo ? tmp.z : lo;
+        out.z = out.z < hi ? out.z : hi;
+        out.w = tmp.w > lo ? tmp.w : lo;
+        out.w = out.w < hi ? out.w : hi;
+        reinterpret_cast<float4*>(output)[idx] = out;
+    }
+}
+```
+
+每个线程处理连续的四个 float，尾部不足四个元素时单独处理，减少线程索引和全局内存访问开销。
 
 ## 中等题
 ### [reduction](https://leetgpu.com/challenges/reduction)
