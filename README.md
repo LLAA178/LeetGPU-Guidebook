@@ -878,49 +878,67 @@ __global__ void count_2d_equal_kernel(const int* input, int* output, int N, int 
 ### [value-clipping](https://leetgpu.com/challenges/value-clipping)
 *环境: CUDA*
 
-> baseline
-```CUDA
-__global__ void clip_kernel(const float* input, float* output, float lo, float hi, int N) {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx >= N) return;
+将每个浮点数限制在 `[lo, hi]` 内。两个版本都只启动一个 kernel，相邻线程连续读写。
 
-    float out = input[idx] > lo ? input[idx] : lo;
-    output[idx] = out < hi ? out : hi;
+> baseline
+
+```CUDA
+#include <cuda_runtime.h>
+
+__global__ void clip_kernel(const float* input, float* output, float lo, float hi, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float value = input[i] > lo ? input[i] : lo;
+    output[i] = value < hi ? value : hi;
+}
+
+extern "C" void solve(const float* input, float* output, float lo, float hi, int n) {
+    clip_kernel<<<(n + 255) / 256, 256>>>(input, output, lo, hi, n);
 }
 ```
 
-每个线程处理一个元素，连续读取输入并连续写回输出；该逐元素操作主要受显存带宽限制。
+每个线程处理一个元素，每个 block 使用 256 个线程。
 
-> vectorized
+> optimized
+
 ```CUDA
-__global__ void clip_kernel(const float* input, float* output, float lo, float hi, int N) {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx > N / 4) return;
+#include <cuda_runtime.h>
+#include <stdint.h>
 
-    if (idx == N / 4) {
-        for (int i = 0; i < N % 4; i++) {
-            float tmp = input[idx * 4 + i];
-            float out = tmp > lo ? tmp : lo;
-            out = out < hi ? out : hi;
-            output[idx * 4 + i] = out;
-        }
-    } else if (idx < N / 4) {
-        const float4 tmp = reinterpret_cast<const float4*>(input)[idx];
-        float4 out;
-        out.x = tmp.x > lo ? tmp.x : lo;
-        out.x = out.x < hi ? out.x : hi;
-        out.y = tmp.y > lo ? tmp.y : lo;
-        out.y = out.y < hi ? out.y : hi;
-        out.z = tmp.z > lo ? tmp.z : lo;
-        out.z = out.z < hi ? out.z : hi;
-        out.w = tmp.w > lo ? tmp.w : lo;
-        out.w = out.w < hi ? out.w : hi;
-        reinterpret_cast<float4*>(output)[idx] = out;
+namespace {
+constexpr int kThreads = 128;
+
+__global__ void clip_pairs(const float2* input, float2* output, float lo, float hi, int pairs) {
+    int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= pairs) return;
+    float2 a = input[i];
+    output[i] = make_float2(fminf(hi, fmaxf(lo, a.x)), fminf(hi, fmaxf(lo, a.y)));
+}
+
+__global__ void clip_scalar(const float* input, float* output, float lo, float hi, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = fminf(hi, fmaxf(lo, input[i]));
+}
+}  // namespace
+
+extern "C" void solve(const float* input, float* output, float lo, float hi, int N) {
+    if (N <= 0) return;
+    uintptr_t addresses = reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(output);
+    if (N % 2 == 0 && addresses % alignof(float2) == 0) {
+        int pairs = N / 2;
+        clip_pairs<<<(pairs + kThreads - 1) / kThreads, kThreads>>>(
+            reinterpret_cast<const float2*>(input), reinterpret_cast<float2*>(output), lo, hi, pairs);
+    } else {
+        clip_scalar<<<(N + kThreads - 1) / kThreads, kThreads>>>(input, output, lo, hi, N);
     }
 }
 ```
 
-每个线程处理连续的四个 float，尾部不足四个元素时单独处理，减少线程索引和全局内存访问开销。
+当长度为偶数且输入、输出地址均按 8 字节对齐时，每个线程用一次 `float2` 加载和一次存储处理两个元素。一个 warp 连续覆盖 64 个浮点数；相同数据量只需一半的线程执行索引计算和边界判断。每个 block 使用 128 个线程，仍覆盖 256 个元素。读写字节总量相同，实际收益取决于机型和启动开销。奇数长度或地址未对齐时走标量路径。
+
+LeetGPU 实测（2026-11-18，NVIDIA A100-80GB，CUDA 12.8，N = 100,000）：`float2` 版通过全部测试（Accepted），耗时 **0.02 ms**，提交时为 **第 92.4 百分位**。耗时按平台显示精度记录。
+
+本地复测时，将上面任一代码块保存为 `solution.cu`，与 [benchmark](solutions/elementwise/value-clipping-benchmark.cu) 一起编译。例如在 T4 上运行 `nvcc -O3 -arch=sm_75 solution.cu value-clipping-benchmark.cu -o bench && ./bench`。
 
 ## 中等题
 ### [reduction](https://leetgpu.com/challenges/reduction)
