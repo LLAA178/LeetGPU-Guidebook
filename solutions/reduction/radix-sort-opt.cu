@@ -14,14 +14,13 @@ constexpr int kWarp = 32;
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / kWarp;  // 8 warps
 constexpr int kBins = 256;
-constexpr int kSmallMaxN = 4096;
+constexpr int kSmallMaxN = 2048;
 
 constexpr int kItemsPerThread = ONESWEEP_ITEMS;
 constexpr int kWarpTile = kWarp * kItemsPerThread;
 constexpr int kTileSize = kThreads * kItemsPerThread;  // 4,096 keys/tile when ONESWEEP_ITEMS=16
 
 constexpr int kMaxN = 100000000;
-constexpr int kMaxTiles = (kMaxN + 4095) / 4096 + 32;  // >= max tiles for any ONESWEEP_ITEMS >= 16
 constexpr int kHistBlocks = 160;                       // 4 resident blocks/SM across 40 T4 SMs
 constexpr unsigned kFullMask = 0xffffffffu;
 
@@ -47,9 +46,8 @@ struct __align__(8) LookbackWord {
     unsigned val;
 };
 
-// Static device BSS state (zero runtime allocation or memset overhead)
-__device__ __align__(16) uint32_t g_temp[kMaxN];
-__device__ __align__(8) LookbackWord g_lookback[static_cast<size_t>(kMaxTiles) * kBins];
+// Persistent heap workspace (zero static BSS bloat so shared-library dlopen inside
+// memory-capped sandboxes always succeeds; allocated at most once on large N > 2048!)
 __device__ uint32_t g_raw_hist[4][kBins];
 __device__ uint32_t g_step_bin_base[4][kBins];
 __device__ StepPlan g_step_plan[4];
@@ -145,12 +143,12 @@ __global__ __launch_bounds__(kThreads) void radix_sort_small_single_block_kernel
             }
             __syncthreads();
 
-            uint32_t keys[16];
-            uint16_t ranks[16];
-            const int warp_base = warp * 512;
+            uint32_t keys[8];
+            uint16_t ranks[8];
+            const int warp_base = warp * 256;
 
             #pragma unroll
-            for (int r = 0; r < 16; ++r) {
+            for (int r = 0; r < 8; ++r) {
                 const int idx = warp_base + r * kWarp + lane;
                 const bool ok = (idx < n);
                 const uint32_t key = ok ? s_buf[cur][idx] : 0u;
@@ -199,7 +197,7 @@ __global__ __launch_bounds__(kThreads) void radix_sort_small_single_block_kernel
 
             const int nxt = cur ^ 1;
             #pragma unroll
-            for (int r = 0; r < 16; ++r) {
+            for (int r = 0; r < 8; ++r) {
                 const int idx = warp_base + r * kWarp + lane;
                 if (idx < n) {
                     const unsigned digit = (keys[r] >> shift) & 0xffu;
@@ -467,6 +465,8 @@ template <int kStep>
 __global__ __launch_bounds__(kThreads, 2) void radix_onesweep_step_kernel(
     const uint32_t* __restrict__ input,
     uint32_t* __restrict__ output,
+    uint32_t* __restrict__ g_temp,
+    LookbackWord* __restrict__ g_lookback,
     int n,
     int num_tiles) {
     __shared__ uint32_t s_keys[kTileSize];
@@ -698,14 +698,58 @@ extern "C" void solve(const unsigned int* input, unsigned int* output, int N) {
     const int num_tiles = (N + kTileSize - 1) / kTileSize;
     const int hist_blocks = (num_tiles < kHistBlocks) ? num_tiles : kHistBlocks;
 
+    // Lazy persistent workspace (zero static BSS -> instant shared-library dlopen,
+    // allocated at most once when N grows, never freed inside timed loops!)
+    static uint32_t* s_temp = nullptr;
+    static size_t s_temp_cap = 0;
+    static LookbackWord* s_lookback = nullptr;
+    static size_t s_lb_cap = 0;
+
+    if (static_cast<size_t>(N) > s_temp_cap) {
+        if (s_temp != nullptr) {
+            cudaFree(s_temp);
+            s_temp = nullptr;
+        }
+        const size_t alloc_n = (static_cast<size_t>(N) < 50000000u) ? 50000000u : static_cast<size_t>(N);
+        if (cudaMalloc(&s_temp, alloc_n * sizeof(uint32_t)) != cudaSuccess) {
+            cudaGetLastError();
+            if (cudaMalloc(&s_temp, static_cast<size_t>(N) * sizeof(uint32_t)) != cudaSuccess) {
+                return;
+            }
+            s_temp_cap = static_cast<size_t>(N);
+        } else {
+            s_temp_cap = alloc_n;
+        }
+    }
+
+    const size_t need_lb = static_cast<size_t>(num_tiles) * static_cast<size_t>(kBins);
+    if (need_lb > s_lb_cap) {
+        if (s_lookback != nullptr) {
+            cudaFree(s_lookback);
+            s_lookback = nullptr;
+        }
+        const size_t min_lb = static_cast<size_t>((50000000 + kTileSize - 1) / kTileSize) * kBins;
+        const size_t alloc_lb = (need_lb < min_lb) ? min_lb : need_lb;
+        if (cudaMalloc(&s_lookback, alloc_lb * sizeof(LookbackWord)) != cudaSuccess) {
+            cudaGetLastError();
+            if (cudaMalloc(&s_lookback, need_lb * sizeof(LookbackWord)) != cudaSuccess) {
+                return;
+            }
+            s_lb_cap = need_lb;
+        } else {
+            s_lb_cap = alloc_lb;
+        }
+        cudaMemsetAsync(s_lookback, 0, s_lb_cap * sizeof(LookbackWord));
+    }
+
     radix_histogram_and_plan_kernel<<<static_cast<unsigned>(hist_blocks), kThreads>>>(
         input, output, N);
     radix_onesweep_step_kernel<0><<<static_cast<unsigned>(num_tiles), kThreads>>>(
-        input, output, N, num_tiles);
+        input, output, s_temp, s_lookback, N, num_tiles);
     radix_onesweep_step_kernel<1><<<static_cast<unsigned>(num_tiles), kThreads>>>(
-        input, output, N, num_tiles);
+        input, output, s_temp, s_lookback, N, num_tiles);
     radix_onesweep_step_kernel<2><<<static_cast<unsigned>(num_tiles), kThreads>>>(
-        input, output, N, num_tiles);
+        input, output, s_temp, s_lookback, N, num_tiles);
     radix_onesweep_step_kernel<3><<<static_cast<unsigned>(num_tiles), kThreads>>>(
-        input, output, N, num_tiles);
+        input, output, s_temp, s_lookback, N, num_tiles);
 }
