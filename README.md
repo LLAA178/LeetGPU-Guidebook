@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [parallel-reverse-scan-gae](#parallel-reverse-scan-gae) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,78 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [parallel-reverse-scan-gae](https://leetgpu.com/challenges/parallel-reverse-scan-gae)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-给定形状为 `[B, S]` 的奖励序列 `rewards` 和状态价值序列 `values`，对每条序列先算出单步时序差分误差 `delta[b, t] = rewards[b, t] + gamma * values[b, t + 1] - values[b, t]`（末尾 `values[b, S] = 0`），再按衰减系数 `decay = gamma * lam` 从右向左递推广义优势估计 `advantages[b, t] = delta[b, t] + decay * advantages[b, t + 1]`。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-拿官方 4 步样例 `rewards = [1, 2, 3, 4]`、`values = [0.5, 1.0, 1.5, 2.0]`、`gamma = 0.9`、`lam = 0.5`（`decay = 0.45`）演示：先算出四步误差 `delta = [1.4, 2.35, 3.3, 2.0]`。串行倒推需要一步步算 `A[3] = 2.0`、`A[2] = 3.3 + 0.45 * 2.0 = 4.2`、`A[1] = 2.35 + 0.45 * 4.2 = 4.24`、`A[0] = 1.4 + 0.45 * 4.24 = 3.308`。并行化利用常数衰减线性递推的结合律：一段长度为 `k` 的区间可以先在内部独立算出局部首项汇总 `sum`（假设区间右侧进位为 0），区间整体对右侧进位的放大倍数恒为 `decay^k`；把相邻左区间 `(sum_L, decay^k_L)` 与右区间 `(sum_R, decay^k_R)` 合并时，新汇总等于 `sum_L + decay^k_L * sum_R`，新放大倍数等于 `decay^(k_L + k_R)`。按两步一组切分上面的 4 个位置，左半组 `[0, 1]` 独立算出 `g1 = 2.35`、`g0 = 1.4 + 0.45 * 2.35 = 2.4575`（跨 2 步倍数为 `0.45^2 = 0.2025`），右半组 `[2, 3]` 独立算出 `A[3] = 2.0`、`A[2] = 4.2`；随后把右半组首项 `4.2` 作为进位一次传给左半组，直接得到 `A[1] = 2.35 + 0.45 * 4.2 = 4.24`、`A[0] = 2.4575 + 0.2025 * 4.2 = 3.308`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline：单序列单线程逆向递推
+> baseline：按级启动的多遍全局蝶形变换
 
-基础版给每条序列 `b` 分配一个线程，从 `t = S - 1` 倒着循环到 `0`，边算 `delta` 边更新 `last_gae`：
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-__global__ void gae_reverse_scan_baseline_kernel(
-    const float* __restrict__ rewards,
-    const float* __restrict__ values,
-    float* __restrict__ advantages,
-    float gamma,
-    float decay,
-    int B,
-    int S) {
-    const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= B) return;
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
 
-    const int row_offset = b * S;
-    float next_v = 0.0f;
-    float last_gae = 0.0f;
-    for (int t = S - 1; t >= 0; --t) {
-        const float v_t = values[row_offset + t];
-        const float delta = fmaf(gamma, next_v, rewards[row_offset + t] - v_t);
-        last_gae = fmaf(decay, last_gae, delta);
-        advantages[row_offset + t] = last_gae;
-        next_v = v_t;
-    }
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
 }
 ```
 
-在官方评测规模 `B = 64, S = 4,096` 下，这种写法全场只启动 64 个线程（仅 2 个 warp，即 32 线程组成的硬件执行单元），每个线程串行依赖跑满 4,096 步，并且同一 warp 内相邻线程访问地址相距 `4,096 * 4 = 16 KB`，全局显存读写完全跨行失配。
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-> optimized：单块整行 `float4` 向量化 + 线程束逆向洗牌扫描
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-优化版让每条序列独占一个线程块（`gridDim.x = B`），在块内把 4,096 步长链压成单遍向量化并行扫描：
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
 
-- **`float4` 合并访存与零重复加载边界传递**：512 个线程各用两次 `float4` 读取连续元素，把单行 4,096 个位置分摊到寄存器并实现满带宽 128 位合并访存。计算每个 `float4` 组第 4 个位置的 `delta` 需要下一个组的首元素 `v4.x`：warp 内部直接用寄存器洗牌指令 `__shfl_down_sync`（同一 warp 内直接读取后方线程寄存器）拿到，跨 warp 边界只用 `s_first_v[16]`（64 字节 shared memory，即块内高速共享内存）中转一次，省去所有重复全局读取。
-- **寄存器局部逆扫 + 两级 `decay^k` 逆向扫描**：每个线程先在寄存器里完成本地 8 个元素的局部逆扫（跨度倍数为 `decay^8`），再在 warp 内用 5 步 `__shfl_down_sync` 完成 32 路逆向前缀合并，接着由第 0 个 warp 在 shared memory 上扫完 16 个 warp 的汇总，最后把右侧进位一次性乘上对应衰减幂次加回局部结果并以 `float4` 合并写回。对超出单块容量的长序列（如 `S = 65,536`）或非对齐输入，同一个块按从右到左的分片循环携带 `row_carry` 和边界 `v0` 扫完全行，无需额外全局工作区或多次启动 kernel。
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
 
 ```cuda
-// 1. 寄存器内 4 元组局部逆向递推（假设右侧进位为 0）
-const float g3 = d3;
-const float g2 = fmaf(p.d1, g3, d2);
-const float g1 = fmaf(p.d1, g2, d1);
-const float g0 = fmaf(p.d1, g1, d0);
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
 
-// 2. warp 内 5 步逆向洗牌合并，固定跨度为 4, 8, 16, 32, 64 步
-float val = g0;
-float nbr = __shfl_down_sync(0xffffffffu, val, 1);
-if (lane <= 30) val = fmaf(p.d4, nbr, val);
-// ... 依次合并跨度 2(d8), 4(d16), 8(d32), 16(d64) ...
-
-// 3. 拿到右侧总进位 c_in 后，一次还原 4 个位置并向量化写回
-float4 out4;
-out4.w = fmaf(p.d1, c_in, g3);
-out4.z = fmaf(p.d2, c_in, g2);
-out4.y = fmaf(p.d3, c_in, g1);
-out4.x = fmaf(p.d4, c_in, g0);
-advantages4[vec_idx] = out4;
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
 ```
 
-0.03 ms 93.3th percentile (T4)
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
 
-这一步消除了单线程 4,096 步串行递推依赖和跨 16 KB 步长的分散访存，把整题的 `3 MiB` 数据读写全部变成单遍 128 位合并访存。在本地 Tesla T4（CUDA 12.4）上实测官方计时规模 `B = 64, S = 4,096`（每次刷空 L2，25 轮中位数）：单线程基线耗时 `0.6864 ms`，优化版（512 线程 × 每线程 2 个 `float4`）降至 **`0.0146 ms`**（提速 **47.0 倍**，有效带宽达 `216.1 GB/s`），两版均通过 45 组多尺寸、极端边界与非对齐地址测试（最大绝对误差 `2.46e-5`）。LeetGPU 官方 Tesla T4 首次提交即通过全部测试，耗时 **`0.03 ms`（第 `93.3` 百分位）**。
-
-完整代码：[单线程逆向递推基线](./solutions/reduction/gae-reverse-scan-baseline.cu) · [向量化线程束逆向扫描优化版](./solutions/reduction/gae-reverse-scan-opt.cu)
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
