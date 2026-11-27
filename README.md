@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [top-k-selection](#top-k-selection) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,60 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [top-k-selection](https://leetgpu.com/challenges/top-k-selection)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-从长度为 `N` 的单精度浮点数组 `input` 中选出最大的 `k` 个数，并按从大到小的顺序写入长度为 `k` 的 `output` 数组。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-先看一个 6 元素找前 `k = 2` 大的小例子：`input = [-2.0, 5.0, 1.0, 8.0, -6.0, 4.0]`，最终结果是 `[8.0, 5.0]`。把两段分块各自保留前 `k = 2` 大再汇总：前半段 `[-2.0, 5.0, 1.0]` 留下 `[5.0, 1.0]`，后半段 `[8.0, 4.0, -6.0]` 留下 `[8.0, 4.0]`；两份局部前 `2` 大合并再取前 `2` 大恰好得到 `[8.0, 5.0]`。即便全部全局前 `k` 大都扎堆在同一个连续区间里，只要每个分区都完整保留本分区的前 `k` 大，汇总结果依然百分之百精确。配合 IEEE-754 保序映射（先把 `-0.0f` 规整为 `+0.0f`，正数翻转最高符号位 `u ^ 0x80000000u`，负数全位取反 `~u`），所有比较都简化为无符号整数 `uint32_t` 比较。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline
+> baseline：按级启动的多遍全局蝶形变换
 
-先把 `input` 映射为 32 位保序无符号整数并补齐到 `2` 的幂次长度（补位填最小值 `0u`），在全局显存上执行双调排序（bitonic sort，一种比较位置固定、适合 GPU 并行的排序网络）将整张表按降序排好，最后把前 `k` 项还原回 `float` 写出。
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-__global__ void bitonic_step_kernel(uint32_t* __restrict__ keys, int padded_n, int j, int stage_k) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= padded_n) return;
-  int ixj = i ^ j;
-  if (ixj > i) {
-    uint32_t a = keys[i];
-    uint32_t b = keys[ixj];
-    bool descending = ((i & stage_k) == 0);
-    if ((descending && a < b) || (!descending && a > b)) {
-      keys[i] = b;
-      keys[ixj] = a;
-    }
-  }
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
 }
 ```
 
-> optimized：单遍流式块内 Top-K 过滤 + L2 二级归并
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-官方性能测试在 `N = 50,000,000`（200 MB）中取 `k = 100`。无论是全量排序还是对五千万个元素逐一发全局原子统计，都会受制于多趟访存或原子排队。当 `k <= 256` 时，优化版把 200 MB 输入均分给 160 个线程块（每块 256 个线程，仅占 8 KiB 共享内存，每个流式多处理器可常驻 4 个块），只顺序读取**一遍** `input` 就完成筛选：
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-- **256 点均匀采样预估下界**：正式扫描前，块内 256 个线程先在所属区间均匀读取 256 个样本，在共享内存（shared memory，线程块内高速片上内存）里排一次双调降序，取第 `k` 大样本作为初始门槛 `thresh`。因为本块真实包含至少 `k` 个大于等于 `thresh` 的元素，扫描一开始就能过滤掉超过 99.6% 的普通元素。
-- **`float4` 满带宽流式扫描与 `__ballot_sync` 零写跳过**：主循环每步以 `float4` 读入 1,024 个元素并在寄存器中与 `thresh` 比较（集齐 `k` 个候选后立即切换为严格大于 `key > thresh`，遇到全相等数组后续零元素入队）。线程束（warp，锁步执行的 32 个线程）用硬件投票指令 `__ballot_sync` 检查是否有元素越过门槛：绝大多数线程束投票结果为 `0`，直接跳过共享内存写入继续读下一批数据；极少数越过门槛的元素才压入 `s_buf` 候选区，满 512 个才触发一次片上双调重排并收紧 `thresh`（31 万元素全程仅触发约 4 次片上重排）。
-- **L2 二级归并写出（`k > 256` 自动切换双级基数桶兜底）**：第一阶段结束时，160 个块各自将前 `k` 大写入静态数组 `g_block_topk`（共 `160 * 100 * 4 B = 64 KB`，完全驻留 L2 缓存）；紧接着启动单个 `<<<1, 256>>>` 归并 kernel，复用同一套片上过滤器在几十微秒内选出全局前 `k` 大写回 `output`。当 `N <= 4096` 时单块一次排完；当 `k > 256` 时自动切到 16 位双级基数直方图路径，覆盖 `1 <= k <= N` 全范围。
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
+
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
 
 ```cuda
-// 线程束投票：无元素超过当前第 k 大门槛 thresh 时，直接跳过共享内存写入
-unsigned any_warp = __ballot_sync(0xffffffffu, p0 || p1 || p2 || p3);
-if (any_warp != 0u) {
-  warp_append_key(k0, p0, s_buf, &s_cand_cnt);
-  warp_append_key(k1, p1, s_buf, &s_cand_cnt);
-  warp_append_key(k2, p2, s_buf, &s_cand_cnt);
-  warp_append_key(k3, p3, s_buf, &s_cand_cnt);
-}
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
 __syncthreads();
-if ((!has_k && s_cand_cnt >= k) || (s_cand_cnt >= 512)) {
-  flush_smem_candidates(s_buf, k, has_k, thresh, &s_cand_cnt);
-}
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
 ```
 
-全量双调排序需要在全局显存上反复读写数百趟，而单遍块内过滤零全局原子操作、零 `cudaMalloc`，把五千万元素的操作压成了单趟 `float4` 顺序流式读取外加约 4 次 8 KiB 片上小数组归约。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.28 ms**（第 **99.7** 百分位）；在官方评测规模 `N = 50,000,000, k = 100`（`200 MB` 输入，每次计时前刷空 L2，15 轮中位数）下，本地 Tesla T4 实测耗时从基线的 `498.90 ms` 降至 **`0.8545 ms`**（提速 **583.9 倍**，等效单遍有效带宽达 **`234.1 GB/s`**）。
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
 
-完整代码：[`top-k-selection-baseline.cu`](./solutions/reduction/top-k-selection-baseline.cu) · [`top-k-selection-opt.cu`](./solutions/reduction/top-k-selection-opt.cu)
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
