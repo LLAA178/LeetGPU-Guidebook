@@ -22,10 +22,10 @@
 | [relu](#relu) | [rotary-positional-embedding](#rotary-positional-embedding) |  |
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
-| [matrix-copy](#matrix-copy) |  |  |
+| [matrix-copy](#matrix-copy) | [fp16-batched-matrix-multiplication](#fp16-batched-matrix-multiplication) |  |
 | [count-array-element](#count-array-element) |  |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
-| [value-clipping](#value-clipping) | [fp16-batched-matrix-multiplication](#fp16-batched-matrix-multiplication) |  |
+| [value-clipping](#value-clipping) |  |  |
 
 ## 简单题
 ### [vector-addition](https://leetgpu.com/challenges/vector-addition)
@@ -1510,283 +1510,6 @@ __global__ void parallel_merge_kernel(const float* a, const float* b, float* c, 
 
 完整代码：[`solutions/reduction/parallel-merge.cu`](./solutions/reduction/parallel-merge.cu)
 
-### [fp16-batched-matrix-multiplication](https://leetgpu.com/challenges/fp16-batched-matrix-multiplication)
-*环境: CUDA，Tensor Core 版本需要 SM 7.0 或更高架构*
-
-这题要算一批半精度浮点（FP16）矩阵乘法：给 `BATCH` 组 `A[M, K]` 和 `B[K, N]`，每组独立算出 `C[M, N] = A × B`。计算过程用单精度浮点（FP32）累加减少误差，写回 `C` 时再转回 FP16。
-
-举个小例子：假设 `M = N = K = 256`，如果直接按最朴素的写法，每个线程算 `C` 里的 1 个数，要从全局显存把 `A` 的一行（256 个数）和 `B` 的一列（256 个数）各读一遍，相邻线程会反复读取同一批数据。
-
-> baseline
-
-每个线程负责 1 个输出元素，沿 `K` 累加点积。同一行里相邻线程的列号连续，因此读取 `B[k * N + col]` 时地址是连续的。
-
-```CUDA
-for (int k = 0; k < K; ++k) {
-    sum = fmaf(__half2float(A[k]), __half2float(B[k * N]), sum);
-}
-```
-
-> tensor core
-
-为了用上 GPU 的矩阵计算单元（Tensor Core），可以让一个线程束（warp，32 个线程）共同负责一块 `32×32` 的输出，4 个线程束拼成一个 `64×64` 的线程块输出区域。每轮沿 `K` 推进 16，调用 `wmma`（矩阵乘加接口）把 4 块 `16×16` 的结果累加在 FP32 寄存器里，最后经共享内存（shared memory，片上高速缓存）转成 FP16 写回。其余不整除或未对齐的尺寸走标量版。
-
-```CUDA
-for (int i = 0; i < 2; ++i) {
-    for (int j = 0; j < 2; ++j) {
-        wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
-    }
-}
-```
-
-这一版在 LeetGPU 官方 A100-80GB 上通过全部测试，耗时 **0.08 ms**（第 **72.6** 百分位）。
-
-> optimized
-
-WMMA 版有两个明显开销：一是每次从全局显存读数据时计算单元在等，二是写回时要绕道共享内存中转。优化版把这两处开销都省掉了：
-- **双缓冲流水线**：在共享内存里准备两份缓冲区。A100 上用 `cp.async`（异步拷贝指令）在后台预取下一块 `A/B`，同时计算当前块，把搬数据的时间藏在计算后面。
-- **直接寄存器写回**：改用底层 `ldmatrix`（片上矩阵加载指令）和 `mma.sync` 指令。它的输出布局里每个线程正好握着相邻的两个元素，可以直接用 `half2`（一次写 2 个 FP16）写回 `C`，省去共享内存中转。
-
-```CUDA
-load_stage(stage[0], A, B, 0);
-for (int t = 0; t < kSize / kDepth; ++t) {
-    wait_stage();
-    if (t + 1 < kSize / kDepth) load_stage(stage[(t + 1) % 2], A, B, (t + 1) * kDepth);
-    compute_stage(stage[t % 2], acc);
-}
-```
-
-这两步优化把 LeetGPU A100-80GB 实测耗时从 **0.08 ms** 压到 **0.04 ms**（快了 2 倍，第 **98.4** 百分位）。
-
-完整代码：[标量版](solutions/matmul/fp16_batched_matrix_multiplication_baseline.cu) · [WMMA 版](solutions/matmul/fp16_batched_matrix_multiplication_wmma.cu) · [双缓冲流水线版](solutions/matmul/fp16_batched_matrix_multiplication_pipelined.cu)
-
-## 困难题
-
-### [multi-head-attention](https://leetgpu.com/challenges/multi-head-attention)
-
-这题可以先从 **Multi-Head Attention** 的三个核心阶段入手：`Q @ K^T`、`softmax`、`P @ V`。把这三步拆清楚之后，再看哪些维度值得分块、哪些数据值得搬进 shared memory 复用，整体思路就会顺很多。
-
-> baseline
-```cuda
-__global__ void mha_kernel(const float* Q,
-                           const float* K,
-                           const float* V,
-                           float* output,
-                           int N,
-                           int d_model,
-                           int h) {
-  int head_size = d_model / h;
-  int q_row = blockIdx.x;
-  int head_idx = blockIdx.y;
-  int tid = threadIdx.x;
-
-  extern __shared__ float shared_mem[];
-  float* scores = shared_mem;
-  float* q_vec = scores + N;
-
-  // load one query row for this head
-  for (int dim = tid; dim < head_size; dim += blockDim.x) {
-    q_vec[dim] = Q[q_row * d_model + head_idx * head_size + dim];
-  }
-  __syncthreads();
-
-  // compute the whole score row
-  for (int k_row = tid; k_row < N; k_row += blockDim.x) {
-    float dot = 0.0f;
-    for (int dim = 0; dim < head_size; ++dim) {
-      dot += q_vec[dim] * K[k_row * d_model + head_idx * head_size + dim];
-    }
-    scores[k_row] = dot * rsqrtf(float(head_size));
-  }
-  __syncthreads();
-
-  // softmax + weighted sum over V
-  ...
-}
-```
-10.94 ms 36.4th (A100)
-
-这版映射很直接：
-
-- 一个 block 处理一个 `(query row, head)`。
-- 先把当前 query 的一整行 head 向量放进 shared memory，避免后面每个 key 都重复读 Q。
-- 再把长度为 `N` 的整行 score 算出来，做 softmax，最后拿权重去乘 `V`。
-
-它的好处是非常好讲，也非常容易对拍。缺点也很明显：
-
-- 同一个 block 要完整扫一遍 `N` 个 key。
-- score 行需要先全部落到 shared memory，再做 softmax。
-- `K` 和 `V` 的 tile 复用还不够积极。
-
-> optimized
-```cuda
-template <int kWarpRows>
-__global__ void flash_attn_small_kernel(const float* Q,
-                                        const float* K,
-                                        const float* V,
-                                        float* output,
-                                        int N,
-                                        int d_model,
-                                        int head_size,
-                                        float scale) {
-  int tx = threadIdx.x;              // lane inside a warp
-  int ty = threadIdx.y;              // warp index inside a block
-  int q_row = blockIdx.x * kWarpRows + ty;
-  int head_offset = blockIdx.y * head_size;
-
-  __shared__ float sQ[kWarpRows][33];
-  __shared__ float sK[32][33];
-  __shared__ float sP[kWarpRows][33];
-
-  float output_local[4] = {0.0f};
-  float running_max = -INFINITY;
-  float running_sum = 0.0f;
-
-  for (int kv_block = 0; kv_block < (N + 31) / 32; ++kv_block) {
-    // load tiled Q/K, compute one 32-key score block
-    // warp_allreduce_max / warp_allreduce_sum for online softmax
-    // reuse shared memory again as V tile and accumulate P @ V
-  }
-
-  // normalize with running_sum and write output
-}
-```
-1.51 ms 95.5th (A100)
-
-这一版的重点在于把分块逻辑真正落到 kernel 映射里，而不只是把实现换成一个 FlashAttention 风格的名字。
-
-先看 block 怎么切：
-
-- `blockIdx.y` 仍然对应 head。
-- `blockIdx.x` 不再只对应一个 query row，而是对应一小组 query row。
-- block 内每个 warp 负责一行 query，所以同一个 block 可以同时处理多行 Q。
-
-这样切的目的，是让一个 block 读进来的 `K/V` tile 能被多个 query row 复用，让同一份 tile 服务多行 query。
-
-再看两层 tile：
-
-1. `N` 维按 32 个 key/value 切块。  
-这表示每一轮只处理 `32` 个 key。当前这 `32` 个 key 的 `K` 和 `V` 会先搬进 shared memory，再被 block 内多个 warp 复用。
-
-2. `head_size` 维也按 32 列切块。  
-因为一个 warp 正好是 32 个 lane，最自然的做法就是让 lane 直接对应 tile 内的一列。比如 `head_size = 128` 时，会被拆成 4 个 `32`-wide 子块，逐块做乘加。
-
-这两个维度一起切，kernel 里实际做的是：
-
-- 外层循环扫 `kv_block`，每次处理 `32` 个 key。
-- 内层循环扫 `d_k tile`，每次处理 `32` 个 head 维度。
-- 同一个 warp 的 32 个 lane，一起把“当前 query 对当前 32 个 key 的 score”算出来。
-
-online softmax 是这套分块能成立的关键。因为我们不想把整行 `N` 个 score 全存下来再做 softmax，而是希望处理完一个 `32-key` 块，就把这一块的信息合并进全局结果。所以每个 warp 持续维护两份状态：
-
-- `running_max`：到当前为止见过的最大 score
-- `running_sum`：在这个最大值基准下累计的 `exp` 和
-
-当前 tile 的 score 算出来后：
-
-- 先用 `warp_allreduce_max` 求出这 32 个 score 的最大值。
-- 再用 `warp_allreduce_sum` 求出这 32 个 `exp(score - new_max)` 的和。
-- 然后把历史累计结果按 `alpha = exp(old_max - new_max)` 统一重标定，再把新块加进去。
-
-这里一定要用 **all-reduce**，不能用只让 `lane0` 正确的 down-reduce。因为 online softmax 里每个 lane 后续都还要继续参与自己的输出列累加，所以所有 lane 都必须拿到同一个 `max` 和 `sum`。
-
-`P @ V` 这一步也复用了同一块 shared memory：
-
-- 前半段 `sK` 存的是 `K` tile，用来算 score。
-- score 和 softmax 做完后，`sK` 这块空间立刻改存 `V` tile。
-- `sP` 里已经放好了当前 32 个 key 的概率权重，于是每个 lane 直接做一段长度为 32 的加权和，累加到 `output_local`。
-
-当前实现的调度策略是：
-
-- `head_size <= 128`：走专门化 small-kernel。
-- `head_size > 128`：走通用 fallback kernel，优先保证题目全范围都能覆盖。
-- `head_size <= 64` 时一个 block 放 8 个 warp；`head_size = 128` 时一个 block 放 4 个 warp，给更宽的头留出更多共享内存和寄存器余量。
-
-所以这题更值得单独看的，是下面三件事怎样一起配合起来：
-
-- `(query row, head)` 怎么映射到 warp / block
-- `N` 和 `head_size` 两个维度为什么都要切 tile
-- online softmax 怎么把“分块处理 score”变成合法的整体 softmax
-
-完整代码：[`solutions/transformer/multi-head-attention.cu`](./solutions/transformer/multi-head-attention.cu)
-
-### [gpt-2-transformer-block](https://leetgpu.com/challenges/gpt-2-transformer-block)
-
-这题不是某一个 kernel 难，而是整条计算图怎么串起来。
-
-如果直接看 packed weights 很容易乱，最稳的方式是先把 block 拆成五段：
-
-1. `LN1`
-2. `QKV -> attention -> output projection`
-3. 第一次 residual
-4. `LN2`
-5. `FC -> GELU -> projection -> residual`
-
-当前实现走的是很朴素但清晰的分段流水：
-
-- LayerNorm 单独 kernel
-- QKV projection 单独 kernel
-- attention 按 `(token, head)` 展开
-- 输出投影走通用线性层
-- FFN 再走一遍 `up -> GELU -> proj`
-
-```cuda
-extern "C" void solve(const float* x, float* output, const float* weights, int seq_len) {
-  // allocate ln1 / qkv / attn / residual / ln2 / ffn buffers
-
-  layerNorm<<<seq_len, 1>>>(x, ln1, weights, seq_len);
-  qkv<<<seq_len, 256>>>(ln1, qkv_buf, weights, seq_len);
-
-  attn<<<dim3(seq_len, kNumHeads), kHeadDim,
-         static_cast<size_t>(seq_len) * sizeof(float)>>>(qkv_buf, attn_concat, weights, seq_len);
-
-  linear_bias<<<linear_grid, 256>>>(
-      attn_concat, attn_proj, weights + kWAttnOffset, weights + kBAttnOffset,
-      seq_len, kDModel, kDModel);
-
-  add_residual<<<(token_count + 255) / 256, 256>>>(x, attn_proj, residual1, token_count);
-  layerNorm2<<<seq_len, 1>>>(residual1, ln2, weights, seq_len);
-  ffn<<<seq_len, 256>>>(ln2, ff2, weights, seq_len);
-  add_residual<<<(token_count + 255) / 256, 256>>>(residual1, ff2, output, token_count);
-}
-```
-
-这一版的价值主要在于把 GPT-2 block 的结构完整跑通，而不是把每一层都做到最优。
-
-里面最值得单独看的是 attention 这步：实现按 `(row, head)` 展开，一个 block 处理一个 query token 的一个 head，先算整行 score，再做 softmax，再拿权重去乘 `V`。
-
-```cuda
-__global__ void attn(const float* qkv, float* output, const float* weights, int seq_len) {
-  int row = blockIdx.x;
-  int head = blockIdx.y;
-  int lane = threadIdx.x;
-  if (row >= seq_len || head >= kNumHeads || lane >= kHeadDim) return;
-
-  extern __shared__ float scores[];
-
-  if (lane == 0) {
-    // compute full score row
-    // softmax over seq_len
-  }
-  __syncthreads();
-
-  float acc = 0.0f;
-  for (int j = 0; j < seq_len; ++j) {
-    acc += scores[j] * V(row=j, head, lane);
-  }
-  output[row * kDModel + head * kHeadDim + lane] = acc;
-}
-```
-
-所以这题的重点不是某一个花哨技巧，而是先把 transformer block 的数据流理顺：
-
-- packed weights 怎么拆
-- 中间 buffer 怎么接
-- residual 放在什么位置
-- attention 的 `(token, head, dim)` 映射怎么落到 kernel
-
-完整代码：[`solutions/transformer/gpt-2-transformer-block.cu`](./solutions/transformer/gpt-2-transformer-block.cu)
-
 ### [int8-quantized-matmul](https://leetgpu.com/challenges/int8-quantized-matmul)
 
 这题最顺的想法不是先看 `A / B`，而是先看输出 `C`。
@@ -2270,6 +1993,56 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 这题和普通逐元素 kernel 的差别在于：优化目标不是少做乘法，而是把“同一个 tile 共用同一个 scale”这件事吃干净。
 
 完整代码：[`solutions/quantization/weight-dequantization.cu`](./solutions/quantization/weight-dequantization.cu)
+
+### [fp16-batched-matrix-multiplication](https://leetgpu.com/challenges/fp16-batched-matrix-multiplication)
+*环境: CUDA，Tensor Core 版本需要 SM 7.0 或更高架构*
+
+这题要算一批半精度浮点（FP16）矩阵乘法：给 `BATCH` 组 `A[M, K]` 和 `B[K, N]`，每组独立算出 `C[M, N] = A × B`。计算过程用单精度浮点（FP32）累加减少误差，写回 `C` 时再转回 FP16。
+
+举个小例子：假设 `M = N = K = 256`，如果直接按最朴素的写法，每个线程算 `C` 里的 1 个数，要从全局显存把 `A` 的一行（256 个数）和 `B` 的一列（256 个数）各读一遍，相邻线程会反复读取同一批数据。
+
+> baseline
+
+每个线程负责 1 个输出元素，沿 `K` 累加点积。同一行里相邻线程的列号连续，因此读取 `B[k * N + col]` 时地址是连续的。
+
+```CUDA
+for (int k = 0; k < K; ++k) {
+    sum = fmaf(__half2float(A[k]), __half2float(B[k * N]), sum);
+}
+```
+
+> tensor core
+
+为了用上 GPU 的矩阵计算单元（Tensor Core），可以让一个线程束（warp，32 个线程）共同负责一块 `32×32` 的输出，4 个线程束拼成一个 `64×64` 的线程块输出区域。每轮沿 `K` 推进 16，调用 `wmma`（矩阵乘加接口）把 4 块 `16×16` 的结果累加在 FP32 寄存器里，最后经共享内存（shared memory，片上高速缓存）转成 FP16 写回。其余不整除或未对齐的尺寸走标量版。
+
+```CUDA
+for (int i = 0; i < 2; ++i) {
+    for (int j = 0; j < 2; ++j) {
+        wmma::mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+}
+```
+
+这一版在 LeetGPU 官方 A100-80GB 上通过全部测试，耗时 **0.08 ms**（第 **72.6** 百分位）。
+
+> optimized
+
+WMMA 版有两个明显开销：一是每次从全局显存读数据时计算单元在等，二是写回时要绕道共享内存中转。优化版把这两处开销都省掉了：
+- **双缓冲流水线**：在共享内存里准备两份缓冲区。A100 上用 `cp.async`（异步拷贝指令）在后台预取下一块 `A/B`，同时计算当前块，把搬数据的时间藏在计算后面。
+- **直接寄存器写回**：改用底层 `ldmatrix`（片上矩阵加载指令）和 `mma.sync` 指令。它的输出布局里每个线程正好握着相邻的两个元素，可以直接用 `half2`（一次写 2 个 FP16）写回 `C`，省去共享内存中转。
+
+```CUDA
+load_stage(stage[0], A, B, 0);
+for (int t = 0; t < kSize / kDepth; ++t) {
+    wait_stage();
+    if (t + 1 < kSize / kDepth) load_stage(stage[(t + 1) % 2], A, B, (t + 1) * kDepth);
+    compute_stage(stage[t % 2], acc);
+}
+```
+
+这两步优化把 LeetGPU A100-80GB 实测耗时从 **0.08 ms** 压到 **0.04 ms**（快了 2 倍，第 **98.4** 百分位）。
+
+完整代码：[标量版](solutions/matmul/fp16_batched_matrix_multiplication_baseline.cu) · [WMMA 版](solutions/matmul/fp16_batched_matrix_multiplication_wmma.cu) · [双缓冲流水线版](solutions/matmul/fp16_batched_matrix_multiplication_pipelined.cu)
 
 ## 困难题
 
