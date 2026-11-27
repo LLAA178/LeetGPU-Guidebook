@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [max-subarray-sum](#max-subarray-sum) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,57 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [max-subarray-sum](https://leetgpu.com/challenges/max-subarray-sum)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-对长度为 `N` 的整数数组 `input` 和固定窗口长度 `window_size`（记为 `W`），在全部 `N - W + 1` 个长度为 `W` 的连续子数组里找出最大的元素和，写入 `output[0]`。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-用官方例子 `input = [1, 2, 4, 2, 3]`、`W = 2` 看清怎样把滑动窗口拆成完全并行的两步：
-1. **先算前缀和 `P`**：设 `P[0] = 0`，依次累加得到 `P = [0, 1, 3, 7, 9, 12]`（中间累加统一用 64 位整数 `long long` 保存，防止元素和中途越过 32 位 `INT_MAX` 溢出）。
-2. **用前缀差并行求每个窗口和**：任意起点 `s` 的长度为 `2` 的窗口和等于 `P[s + 2] - P[s]`。四个窗口同时做一次减法即可算出 `[3 - 0, 7 - 1, 9 - 3, 12 - 7] = [3, 6, 6, 5]`，再做一次最大值归约得到 `6`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline
+> baseline：按级启动的多遍全局蝶形变换
 
-基线版直接让每个线程认领若干个窗口起点 `s`，在内层循环里顺着 `k = 0 .. W - 1` 把这 `W` 个数加起来，再用线程束洗牌指令 `__shfl_down_sync` 与片上共享内存（shared memory）归约出全局最大值：
-
-```cuda
-int local_max = INT_MIN;
-for (int s = global_tid; s < num_windows; s += stride) {
-    long long sum = 0;
-    for (int k = 0; k < window_size; ++k) {
-        sum += static_cast<long long>(input[s + k]);
-    }
-    local_max = max(local_max, static_cast<int>(sum));
-}
-// 块内与跨块归约 local_max 写回 output[0]
-```
-
-> optimized：64 位前缀和 + 共享内存块偏移融合差分归约
-
-在官方计时规模 `N = 50,000, W = 25,000` 下，基线版对 `25,001` 个窗口各自累加 `25,000` 个数，总加法次数高达 `6.25 亿` 次；而整份输入数组其实只有 `200 KB`，完全装得进 Tesla T4 的 `4 MiB` 二级缓存（L2 cache）。只要换成前缀和差分，总计算量立刻从 `O(N × W)` 降到 `O(N)`；更进一步，在 `200 KB` 这种小数据规模下，连内核启动次数本身都是主要耗时项，因此还要把传统三趟前缀和压成两趟：
-
-- **第一趟（`int4` 分块局部扫描）**：每个 256 线程块用 `int4`（单条 128 位指令一次读取 4 个连续 `int`）负责 `1,024` 个元素，`N = 50,000` 只需 `49` 个块。块内用寄存器洗牌指令 `__shfl_up_sync` 算出本块的 `long long` 局部前缀和写入静态设备端数组 `g_prefix`（驻留在 L2 缓存中），同时把本块总和写入 `g_tile_sums[tile]`，并顺手把 `output[0]` 预置为 `INT_MIN` 覆盖可能存在的脏初值。
-- **第二趟（块总和片上扫描与窗口差分二合一）**：`49` 个分块总和还不到 `400` 字节。第二个核函数启动后，直接在片上共享内存里花几个时钟周期把 `g_tile_sums` 扫描成块偏移表 `s_tile_excl`，省去单独启动中间层块扫描核函数的开销；随后每个线程直接按 `P(k) = g_prefix[k] + s_tile_excl[(k - 1) >> 10]` 即时拼出窗口首尾的全局前缀和做减法，块内归约出最大值后调用一次 `atomicMax(output, block_max)` 完成汇总：
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-// 片上共享内存算出每个 1024 元分块的全局偏移 s_tile_excl 后，直接拼出窗口首尾前缀差
-int local_max = INT_MIN;
-for (int win = global_tid; win < num_windows; win += stride) {
-    const int end_idx = win + W;
-    const long long p_end = g_prefix[end_idx] + s_tile_excl[(end_idx - 1) >> 10];
-    const long long p_start = (win == 0) ? 0LL : (g_prefix[win] + s_tile_excl[(win - 1) >> 10]);
-    const int diff = static_cast<int>(p_end - p_start);
-    if (diff > local_max) local_max = diff;
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
 }
 ```
 
-0.04 ms 99.5th percentile (T4)
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-整套实现零 `cudaMalloc`、零 `cudaMemset`，并按数组长度分三档覆盖全范围：`N <= 4,096` 直接单块全片上一次内核搞定；`4,096 < N <= 2,097,152` 走上述两趟 L2 前缀差分管线；超大输入 `N > 2,097,152` 自动切换分块增量滑动扫描兜底，保持严格 `O(N)` 复杂度且不占额外显存。
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-本地 Tesla T4（CUDA 12.4）每次计时前刷空 L2 缓存，在官方计时规模 `N = 50,000, window_size = 25,000` 下取 15 轮中位数：逐窗口累加基线耗时 `1.0851 ms`，两趟前缀差分优化版降至 **`0.0122 ms`**（提速 **89.2 倍**），两版均通过 21 组全负数、首窗口最大、单窗口 `W = N`、32 位前缀和溢出与非对齐地址测试。LeetGPU 官方 Tesla T4 首次提交即通过全部测试，耗时 **`0.04 ms`（第 `99.5` 百分位）**。
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
 
-完整代码：[逐窗口并行基线](./solutions/reduction/max-subarray-sum-baseline.cu) · [64 位前缀和融合差分优化](./solutions/reduction/max-subarray-sum-opt.cu)
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
+
+```cuda
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
+```
+
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
+
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
