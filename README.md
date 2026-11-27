@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [causal-depthwise-conv1d](#causal-depthwise-conv1d) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,84 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [causal-depthwise-conv1d](https://leetgpu.com/challenges/causal-depthwise-conv1d)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-给定按通道在最内维存储（channels-last，形状 `[B, L, D]`）的输入序列 `x`、逐通道卷积核 `weight`（形状 `[D, K]`）和偏置 `bias`（形状 `[D]`），对每个通道独立计算一维因果卷积：`output[b, l, d] = bias[d] + sum_{k=0}^{min(K-1, l)} weight[d, k] * x[b, l - k, d]`（序列起点左侧 `l - k < 0` 的位置按 `0` 处理）。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-拿官方样例 `B = 1, L = 4, D = 2, K = 3` 演示：`x = [[[1, 2], [3, 4], [5, 6], [7, 8]]]`，`weight = [[1, 0, -1], [1, 1, 1]]`，`bias = [0, 0]`。这里 `weight[d, 0]` 乘在当前时刻 `x[b, l, d]` 上，`weight[d, 1]` 和 `weight[d, 2]` 依次乘在前一时刻 `l - 1` 和更早时刻 `l - 2` 上，越过左边界的时刻补零：
-- `l = 0`（左侧补两个 `0`）：通道 0 为 `1*1 + 0*0 + (-1)*0 = 1`，通道 1 为 `1*2 = 2`；
-- `l = 1`（左侧补一个 `0`）：通道 0 为 `1*3 + 0*1 + (-1)*0 = 3`，通道 1 为 `1*4 + 1*2 = 6`；
-- `l = 2`（窗口完整覆盖 `l = 2, 1, 0`）：通道 0 为 `1*5 + 0*3 + (-1)*1 = 4`，通道 1 为 `1*6 + 1*4 + 1*2 = 12`；
-- `l = 3`（窗口向右滑一步覆盖 `l = 3, 2, 1`）：通道 0 为 `1*7 + 0*5 + (-1)*3 = 4`，通道 1 为 `1*8 + 1*6 + 1*4 = 18`，输出 `[[[1, 2], [3, 6], [4, 12], [4, 18]]]`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline：单输出元素单线程直接卷积
+> baseline：按级启动的多遍全局蝶形变换
 
-基础版给每个 `(b, l, d)` 输出位置分配一个线程，每次直接从全局显存读取最多 `K` 个历史时刻的输入与对应的卷积权重：
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-__global__ void causal_depthwise_conv1d_baseline_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    const float* __restrict__ bias,
-    float* __restrict__ output,
-    int B, int L, int D, int K) {
-    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t total = static_cast<size_t>(B) * L * D;
-    if (idx >= total) return;
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
 
-    const int d = static_cast<int>(idx % D);
-    const size_t bl = idx / D;
-    const int l = static_cast<int>(bl % L);
-    const int b = static_cast<int>(bl / L);
-
-    const size_t batch_base = static_cast<size_t>(b) * L * D;
-    const int k_max = (K - 1 < l) ? (K - 1) : l;
-    float acc = bias[d];
-    for (int k = 0; k <= k_max; ++k) {
-        acc = fmaf(weight[d * K + k], x[batch_base + static_cast<size_t>(l - k) * D + d], acc);
-    }
-    output[idx] = acc;
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
 }
 ```
 
-在官方评测规模 `B = 8, L = 2,048, D = 4,096, K = 4` 下，输入和输出张量各占 256 MiB。单元素一线程的写法在每个时刻都要重新去全局显存读 `x[l], x[l-1], x[l-2], x[l-3]` 四行，跨线程块缺乏时间维局部性，导致 256 MiB 的输入被放大成接近 4 倍的重复读取，每个输出位置还要重复读取 `weight`。
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-> optimized：通道维 `float4` 向量化 + 时间维寄存器滑动窗口
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-因为最内维正好是互不耦合的通道维 `D`，相邻通道在同一时刻内存连续，而相邻时刻只共享同一个通道自身的历史值，可以直接用寄存器在时间维做滑动窗口：
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
 
-- **通道维 `float4` 合并读写与权重常驻寄存器**：每个线程负责 4 个连续通道（1 个 `float4`），一个 128 线程块覆盖 512 个连续通道；同一 warp（32 线程组成的硬件执行单元）每次读写恰好拼成连续 512 字节的满带宽合并访存。线程在进入时间循环前先把这 4 个通道的 `bias` 和 `4 * K` 个 `weight` 一次性读入寄存器（当 `K = 4` 时通过 4 次 `float4` 向量读取并在寄存器内完成 `4x4` 转置），整段序列推进期间零重复加载权重。
-- **时间分片流式推进（零 shared memory、零同步）**：把序列维 `L` 切成长度为 `kLTile = 128` 的时间片。每个线程先预热分片左边界外的 `K - 1 = 3` 个历史 `float4`（越界位置填 `0`），随后沿时间维从前往后顺序扫过 128 步：每一步只发**一次** `float4` 全局读取拿到 `x_cur`，和寄存器里的 `hist[0..K-2]` 做乘加后立即发出**一次** `float4` 全局写回，并把窗口寄存器整体顺移一格。整个过程完全停留在单线程私有寄存器里，省掉块内共享内存（shared memory）中转与 `__syncthreads()` 同步，边界历史重读开销只剩 `3 / 128 = 2.3%`。
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
 
 ```cuda
-// 预热分片左边界的 K - 1 个历史时刻（越过 l = 0 的位置填 0）
-#pragma unroll
-for (int h = 0; h < K - 1; ++h) {
-    const int hl = l_start - 1 - h;
-    hist[h] = (hl >= 0) ? __ldg(&x4[batch_offset4 + static_cast<size_t>(hl) * D4]) : zero_float4();
-}
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
 
-// 流式推进 kLTile 步：每步仅 1 次 float4 读取 + 1 次 float4 写回
-#pragma unroll 8
-for (int s = 0; s < kLTile; ++s) {
-    const float4 x_cur = __ldg(&x4[ptr_idx]);
-    float4 acc = fma_float4(w_tap[0], x_cur, b_vec);
-    #pragma unroll
-    for (int k = 1; k < K; ++k) acc = fma_float4(w_tap[k], hist[k - 1], acc);
-    #pragma unroll
-    for (int h = K - 2; h > 0; --h) hist[h] = hist[h - 1];
-    hist[0] = x_cur;
-    out4[ptr_idx] = acc;
-    ptr_idx += D4;
-}
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
 ```
 
-2.44 ms 94.8th percentile (T4)
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
 
-这一步省去了每个时刻对前 `K - 1` 行输入的重复全局显存读取以及逐位置重读权重的开销，让 `K = 4` 时的全局访存量逼近一读一写的 `512 MiB` 理论下限。在本地 Tesla T4（CUDA 12.4）上实测官方计时规模 `B = 8, L = 2,048, D = 4,096, K = 4`（每次刷空 L2，15 轮中位数）：单元素基线耗时 `2.833 ms`，优化版降至 **`1.940 ms`**（等效单遍有效带宽达 **`276.8 GB/s`**），两版均通过 31 组多尺寸、任意核宽 `K`、`K > L` 左端零填充与非对齐地址测试（最大绝对误差 `2.60e-6`）。LeetGPU 官方 Tesla T4 首次提交即通过全部测试，耗时 **`2.44 ms`（第 `94.8` 百分位）**。
-
-完整代码：[单元素直接卷积基线](./solutions/convolution/causal-depthwise-conv1d-baseline.cu) · [通道向量化寄存器滑窗优化版](./solutions/convolution/causal-depthwise-conv1d-opt.cu)
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
