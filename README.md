@@ -22,8 +22,8 @@
 | [relu](#relu) | [rotary-positional-embedding](#rotary-positional-embedding) |  |
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
-| [matrix-copy](#matrix-copy) |  |  |
-| [count-array-element](#count-array-element) | [grouped-query-attention](#grouped-query-attention) |  |
+| [matrix-copy](#matrix-copy) | [grouped-query-attention](#grouped-query-attention) |  |
+| [count-array-element](#count-array-element) |  |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -1755,266 +1755,6 @@ __global__ void accumulate_stats_tiled_kernel(const float* input,
 
 完整代码：[`solutions/normalization/batch-normalization.cu`](./solutions/normalization/batch-normalization.cu)
 
-### [grouped-query-attention](https://leetgpu.com/challenges/grouped-query-attention)
-*环境: CUDA，Tensor Core 路径需要 SM 8.0 或更高架构*
-
-这题要算分组查询注意力（GQA）：把 `num_q_heads` 个查询头（Q）均分成 `num_kv_heads` 组，每组共享同一份键（K）和值（V），按 `softmax(Q × K^T / sqrt(head_dim)) × V` 算出输出，所有张量都是单精度浮点（FP32）。
-
-举个小例子：假设有 4 个 Q 头、2 个 KV 头，那么 `Q[0], Q[1]` 都去查 `K[0], V[0]`，`Q[2], Q[3]` 都去查 `K[1], V[1]`。如果先把完整的 `seq_len × seq_len` 注意力分数表写回全局显存再做 softmax，读写量会非常大。
-
-> baseline
-
-每个线程束（warp，32 个线程）负责一个 Q 头里的一行输出，把这一行 `Q` 和输出累加器 `O` 留在寄存器里。遍历 `K/V` 的每一行时，用 Online Softmax（在线归一化）一边扫一边更新当前最大值 `m` 和指数和 `l`，最后统一除以 `l`，全程不需要把分数表写进显存。
-
-```CUDA
-float m_new = fmaxf(m, score);
-float alpha = expf(m - m_new);
-float p = expf(score - m_new);
-l = l * alpha + p;
-for (int i = 0; i < elems_per_lane; ++i) {
-    o_reg[i] = fmaf(p, v_ptr[d], o_reg[i] * alpha);
-}
-m = m_new;
-```
-
-> optimized
-
-基线版每次只算一行 Q，每行都要重新从显存读一遍完整的 `K/V`。优化版针对 `head_dim = 128` 做了三件事把速度提上去：
-- **分块复用 `K/V`**：一个线程块（4 个线程束）一次处理 64 行 `Q`，沿序列长度每次把 64 行 `K/V` 用 `cp.async`（异步拷贝指令）搬进共享内存（片上高速缓存），64 行 `Q` 共享同一块 `K/V`，显存读取量大幅下降。
-- **3-MMA TF32 拆分**：A100 的矩阵计算单元（Tensor Core）原生支持 TF32（10 位尾数，速度是普通 FP32 的 8 倍），但单次 TF32 截断在 `head_dim = 128` 下会产生约 `3.5e-4` 误差。把每个 FP32 数拆成高位和低位两段 TF32（`x = x_hi + x_lo`），用 `hi·hi + hi·lo + lo·hi` 三条矩阵乘加指令累加到 FP32，既保住 FP32 精度，又保留了 Tensor Core 的高吞吐。
-- **纯寄存器做 Softmax**：矩阵乘加的输出布局里，同一行的元素恰好分布在 4 个同组线程上。行最大值和行和只需两次线程束内洗牌（`__shfl_xor_sync`）就能算完，完全不经过共享内存。SM 8.0 以下或其他维度自动回退到共享内存分块的 FP32 路径。
-
-优化版在 LeetGPU 官方 A100-80GB 上通过全部测试，耗时 **1.23 ms**（第 **94.7** 百分位）。
-
-完整代码：[Online Softmax 基线版](solutions/transformer/grouped_query_attention_baseline.cu) · [FlashAttention-2 + 3-MMA TF32 优化版](solutions/transformer/grouped_query_attention_flash.cu)
-
-## 困难题
-
-### [multi-head-attention](https://leetgpu.com/challenges/multi-head-attention)
-
-这题可以先从 **Multi-Head Attention** 的三个核心阶段入手：`Q @ K^T`、`softmax`、`P @ V`。把这三步拆清楚之后，再看哪些维度值得分块、哪些数据值得搬进 shared memory 复用，整体思路就会顺很多。
-
-> baseline
-```cuda
-__global__ void mha_kernel(const float* Q,
-                           const float* K,
-                           const float* V,
-                           float* output,
-                           int N,
-                           int d_model,
-                           int h) {
-  int head_size = d_model / h;
-  int q_row = blockIdx.x;
-  int head_idx = blockIdx.y;
-  int tid = threadIdx.x;
-
-  extern __shared__ float shared_mem[];
-  float* scores = shared_mem;
-  float* q_vec = scores + N;
-
-  // load one query row for this head
-  for (int dim = tid; dim < head_size; dim += blockDim.x) {
-    q_vec[dim] = Q[q_row * d_model + head_idx * head_size + dim];
-  }
-  __syncthreads();
-
-  // compute the whole score row
-  for (int k_row = tid; k_row < N; k_row += blockDim.x) {
-    float dot = 0.0f;
-    for (int dim = 0; dim < head_size; ++dim) {
-      dot += q_vec[dim] * K[k_row * d_model + head_idx * head_size + dim];
-    }
-    scores[k_row] = dot * rsqrtf(float(head_size));
-  }
-  __syncthreads();
-
-  // softmax + weighted sum over V
-  ...
-}
-```
-10.94 ms 36.4th (A100)
-
-这版映射很直接：
-
-- 一个 block 处理一个 `(query row, head)`。
-- 先把当前 query 的一整行 head 向量放进 shared memory，避免后面每个 key 都重复读 Q。
-- 再把长度为 `N` 的整行 score 算出来，做 softmax，最后拿权重去乘 `V`。
-
-它的好处是非常好讲，也非常容易对拍。缺点也很明显：
-
-- 同一个 block 要完整扫一遍 `N` 个 key。
-- score 行需要先全部落到 shared memory，再做 softmax。
-- `K` 和 `V` 的 tile 复用还不够积极。
-
-> optimized
-```cuda
-template <int kWarpRows>
-__global__ void flash_attn_small_kernel(const float* Q,
-                                        const float* K,
-                                        const float* V,
-                                        float* output,
-                                        int N,
-                                        int d_model,
-                                        int head_size,
-                                        float scale) {
-  int tx = threadIdx.x;              // lane inside a warp
-  int ty = threadIdx.y;              // warp index inside a block
-  int q_row = blockIdx.x * kWarpRows + ty;
-  int head_offset = blockIdx.y * head_size;
-
-  __shared__ float sQ[kWarpRows][33];
-  __shared__ float sK[32][33];
-  __shared__ float sP[kWarpRows][33];
-
-  float output_local[4] = {0.0f};
-  float running_max = -INFINITY;
-  float running_sum = 0.0f;
-
-  for (int kv_block = 0; kv_block < (N + 31) / 32; ++kv_block) {
-    // load tiled Q/K, compute one 32-key score block
-    // warp_allreduce_max / warp_allreduce_sum for online softmax
-    // reuse shared memory again as V tile and accumulate P @ V
-  }
-
-  // normalize with running_sum and write output
-}
-```
-1.51 ms 95.5th (A100)
-
-这一版的重点在于把分块逻辑真正落到 kernel 映射里，而不只是把实现换成一个 FlashAttention 风格的名字。
-
-先看 block 怎么切：
-
-- `blockIdx.y` 仍然对应 head。
-- `blockIdx.x` 不再只对应一个 query row，而是对应一小组 query row。
-- block 内每个 warp 负责一行 query，所以同一个 block 可以同时处理多行 Q。
-
-这样切的目的，是让一个 block 读进来的 `K/V` tile 能被多个 query row 复用，让同一份 tile 服务多行 query。
-
-再看两层 tile：
-
-1. `N` 维按 32 个 key/value 切块。  
-这表示每一轮只处理 `32` 个 key。当前这 `32` 个 key 的 `K` 和 `V` 会先搬进 shared memory，再被 block 内多个 warp 复用。
-
-2. `head_size` 维也按 32 列切块。  
-因为一个 warp 正好是 32 个 lane，最自然的做法就是让 lane 直接对应 tile 内的一列。比如 `head_size = 128` 时，会被拆成 4 个 `32`-wide 子块，逐块做乘加。
-
-这两个维度一起切，kernel 里实际做的是：
-
-- 外层循环扫 `kv_block`，每次处理 `32` 个 key。
-- 内层循环扫 `d_k tile`，每次处理 `32` 个 head 维度。
-- 同一个 warp 的 32 个 lane，一起把“当前 query 对当前 32 个 key 的 score”算出来。
-
-online softmax 是这套分块能成立的关键。因为我们不想把整行 `N` 个 score 全存下来再做 softmax，而是希望处理完一个 `32-key` 块，就把这一块的信息合并进全局结果。所以每个 warp 持续维护两份状态：
-
-- `running_max`：到当前为止见过的最大 score
-- `running_sum`：在这个最大值基准下累计的 `exp` 和
-
-当前 tile 的 score 算出来后：
-
-- 先用 `warp_allreduce_max` 求出这 32 个 score 的最大值。
-- 再用 `warp_allreduce_sum` 求出这 32 个 `exp(score - new_max)` 的和。
-- 然后把历史累计结果按 `alpha = exp(old_max - new_max)` 统一重标定，再把新块加进去。
-
-这里一定要用 **all-reduce**，不能用只让 `lane0` 正确的 down-reduce。因为 online softmax 里每个 lane 后续都还要继续参与自己的输出列累加，所以所有 lane 都必须拿到同一个 `max` 和 `sum`。
-
-`P @ V` 这一步也复用了同一块 shared memory：
-
-- 前半段 `sK` 存的是 `K` tile，用来算 score。
-- score 和 softmax 做完后，`sK` 这块空间立刻改存 `V` tile。
-- `sP` 里已经放好了当前 32 个 key 的概率权重，于是每个 lane 直接做一段长度为 32 的加权和，累加到 `output_local`。
-
-当前实现的调度策略是：
-
-- `head_size <= 128`：走专门化 small-kernel。
-- `head_size > 128`：走通用 fallback kernel，优先保证题目全范围都能覆盖。
-- `head_size <= 64` 时一个 block 放 8 个 warp；`head_size = 128` 时一个 block 放 4 个 warp，给更宽的头留出更多共享内存和寄存器余量。
-
-所以这题更值得单独看的，是下面三件事怎样一起配合起来：
-
-- `(query row, head)` 怎么映射到 warp / block
-- `N` 和 `head_size` 两个维度为什么都要切 tile
-- online softmax 怎么把“分块处理 score”变成合法的整体 softmax
-
-完整代码：[`solutions/transformer/multi-head-attention.cu`](./solutions/transformer/multi-head-attention.cu)
-
-### [gpt-2-transformer-block](https://leetgpu.com/challenges/gpt-2-transformer-block)
-
-这题不是某一个 kernel 难，而是整条计算图怎么串起来。
-
-如果直接看 packed weights 很容易乱，最稳的方式是先把 block 拆成五段：
-
-1. `LN1`
-2. `QKV -> attention -> output projection`
-3. 第一次 residual
-4. `LN2`
-5. `FC -> GELU -> projection -> residual`
-
-当前实现走的是很朴素但清晰的分段流水：
-
-- LayerNorm 单独 kernel
-- QKV projection 单独 kernel
-- attention 按 `(token, head)` 展开
-- 输出投影走通用线性层
-- FFN 再走一遍 `up -> GELU -> proj`
-
-```cuda
-extern "C" void solve(const float* x, float* output, const float* weights, int seq_len) {
-  // allocate ln1 / qkv / attn / residual / ln2 / ffn buffers
-
-  layerNorm<<<seq_len, 1>>>(x, ln1, weights, seq_len);
-  qkv<<<seq_len, 256>>>(ln1, qkv_buf, weights, seq_len);
-
-  attn<<<dim3(seq_len, kNumHeads), kHeadDim,
-         static_cast<size_t>(seq_len) * sizeof(float)>>>(qkv_buf, attn_concat, weights, seq_len);
-
-  linear_bias<<<linear_grid, 256>>>(
-      attn_concat, attn_proj, weights + kWAttnOffset, weights + kBAttnOffset,
-      seq_len, kDModel, kDModel);
-
-  add_residual<<<(token_count + 255) / 256, 256>>>(x, attn_proj, residual1, token_count);
-  layerNorm2<<<seq_len, 1>>>(residual1, ln2, weights, seq_len);
-  ffn<<<seq_len, 256>>>(ln2, ff2, weights, seq_len);
-  add_residual<<<(token_count + 255) / 256, 256>>>(residual1, ff2, output, token_count);
-}
-```
-
-这一版的价值主要在于把 GPT-2 block 的结构完整跑通，而不是把每一层都做到最优。
-
-里面最值得单独看的是 attention 这步：实现按 `(row, head)` 展开，一个 block 处理一个 query token 的一个 head，先算整行 score，再做 softmax，再拿权重去乘 `V`。
-
-```cuda
-__global__ void attn(const float* qkv, float* output, const float* weights, int seq_len) {
-  int row = blockIdx.x;
-  int head = blockIdx.y;
-  int lane = threadIdx.x;
-  if (row >= seq_len || head >= kNumHeads || lane >= kHeadDim) return;
-
-  extern __shared__ float scores[];
-
-  if (lane == 0) {
-    // compute full score row
-    // softmax over seq_len
-  }
-  __syncthreads();
-
-  float acc = 0.0f;
-  for (int j = 0; j < seq_len; ++j) {
-    acc += scores[j] * V(row=j, head, lane);
-  }
-  output[row * kDModel + head * kHeadDim + lane] = acc;
-}
-```
-
-所以这题的重点不是某一个花哨技巧，而是先把 transformer block 的数据流理顺：
-
-- packed weights 怎么拆
-- 中间 buffer 怎么接
-- residual 放在什么位置
-- attention 的 `(token, head, dim)` 映射怎么落到 kernel
-
-完整代码：[`solutions/transformer/gpt-2-transformer-block.cu`](./solutions/transformer/gpt-2-transformer-block.cu)
-
 ### [rotary-positional-embedding](https://leetgpu.com/challenges/rotary-positional-embedding)
 
 RoPE 的核心不是矩阵乘，而是成对变换。
@@ -2253,6 +1993,39 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 这题和普通逐元素 kernel 的差别在于：优化目标不是少做乘法，而是把“同一个 tile 共用同一个 scale”这件事吃干净。
 
 完整代码：[`solutions/quantization/weight-dequantization.cu`](./solutions/quantization/weight-dequantization.cu)
+
+### [grouped-query-attention](https://leetgpu.com/challenges/grouped-query-attention)
+*环境: CUDA，Tensor Core 路径需要 SM 8.0 或更高架构*
+
+这题要算分组查询注意力（GQA）：把 `num_q_heads` 个查询头（Q）均分成 `num_kv_heads` 组，每组共享同一份键（K）和值（V），按 `softmax(Q × K^T / sqrt(head_dim)) × V` 算出输出，所有张量都是单精度浮点（FP32）。
+
+举个小例子：假设有 4 个 Q 头、2 个 KV 头，那么 `Q[0], Q[1]` 都去查 `K[0], V[0]`，`Q[2], Q[3]` 都去查 `K[1], V[1]`。如果先把完整的 `seq_len × seq_len` 注意力分数表写回全局显存再做 softmax，读写量会非常大。
+
+> baseline
+
+每个线程束（warp，32 个线程）负责一个 Q 头里的一行输出，把这一行 `Q` 和输出累加器 `O` 留在寄存器里。遍历 `K/V` 的每一行时，用 Online Softmax（在线归一化）一边扫一边更新当前最大值 `m` 和指数和 `l`，最后统一除以 `l`，全程不需要把分数表写进显存。
+
+```CUDA
+float m_new = fmaxf(m, score);
+float alpha = expf(m - m_new);
+float p = expf(score - m_new);
+l = l * alpha + p;
+for (int i = 0; i < elems_per_lane; ++i) {
+    o_reg[i] = fmaf(p, v_ptr[d], o_reg[i] * alpha);
+}
+m = m_new;
+```
+
+> optimized
+
+基线版每次只算一行 Q，每行都要重新从显存读一遍完整的 `K/V`。优化版针对 `head_dim = 128` 做了三件事把速度提上去：
+- **分块复用 `K/V`**：一个线程块（4 个线程束）一次处理 64 行 `Q`，沿序列长度每次把 64 行 `K/V` 用 `cp.async`（异步拷贝指令）搬进共享内存（片上高速缓存），64 行 `Q` 共享同一块 `K/V`，显存读取量大幅下降。
+- **3-MMA TF32 拆分**：A100 的矩阵计算单元（Tensor Core）原生支持 TF32（10 位尾数，速度是普通 FP32 的 8 倍），但单次 TF32 截断在 `head_dim = 128` 下会产生约 `3.5e-4` 误差。把每个 FP32 数拆成高位和低位两段 TF32（`x = x_hi + x_lo`），用 `hi·hi + hi·lo + lo·hi` 三条矩阵乘加指令累加到 FP32，既保住 FP32 精度，又保留了 Tensor Core 的高吞吐。
+- **纯寄存器做 Softmax**：矩阵乘加的输出布局里，同一行的元素恰好分布在 4 个同组线程上。行最大值和行和只需两次线程束内洗牌（`__shfl_xor_sync`）就能算完，完全不经过共享内存。SM 8.0 以下或其他维度自动回退到共享内存分块的 FP32 路径。
+
+优化版在 LeetGPU 官方 A100-80GB 上通过全部测试，耗时 **1.23 ms**（第 **94.7** 百分位）。
+
+完整代码：[Online Softmax 基线版](solutions/transformer/grouped_query_attention_baseline.cu) · [FlashAttention-2 + 3-MMA TF32 优化版](solutions/transformer/grouped_query_attention_flash.cu)
 
 ## 困难题
 
