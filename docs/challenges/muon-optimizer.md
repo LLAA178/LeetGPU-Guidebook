@@ -36,6 +36,6 @@ const half2 lo = __floats2half2_rn((s0 - hi_f.x) * 2048.0f, (s1 - hi_f.y) * 2048
 
 - **单趟范数预取与末步尾部融合**：首趟用 `float4`（单条 128 位指令读取 4 个连续 `float`）合并读入 `G` 与 `Buf` 算出 `V` 缓存在 L2 中，同时用无锁末尾块归约算出双精度 `||V||_F`，避免二次读取输入；第 5 轮的 `a X + B X` 在核函数尾部直接乘上 `sqrt(max(M, N))`（并在 `M > N` 时于片上完成合并转置）一步写回 `output`。极小尺寸自动走同样带对称剪枝的纯单精度寄存器分块路径。
 
-本地 Tesla T4（CUDA 12.4）每次计时前刷空 L2 缓存，在官方计时规模 `M = 1,024, N = 1,024, momentum = 0.9` 下取 15 轮中位数：分块单精度基线耗时 `51.75 ms`，对称剪枝 Tensor Core 优化版降至 **`4.61 ms`**（提速 **`11.23x`**，折算标称算力达 `6.99 TFLOPS`）。
+本地 Tesla T4（CUDA 12.4）每次计时前刷空 L2 缓存，在官方计时规模 `M = 1,024, N = 1,024, momentum = 0.9` 下取 15 轮中位数：分块单精度基线耗时 `51.75 ms`，对称剪枝 Tensor Core 优化版降至 **`4.61 ms`**（提速 **`11.23x`**，折算标称算力达 `6.99 TFLOPS`）；在 LeetGPU 官方 T4 评测中一次通过全部测试，耗时 **8.46 ms**（第 **98.5** 百分位）。
 
 完整代码：[分块单精度基线](../../solutions/matmul/muon-optimizer-baseline.cu) · [对称剪枝 Tensor Core 融合优化](../../solutions/matmul/muon-optimizer-opt.cu)
