@@ -11,7 +11,7 @@
 
 ## 逐题独立题解
 
-新增题目的独立中文题解统一存放在 [`docs/challenges/`](docs/challenges/) 目录下（每题一个文件，避免多 PR 并行合并冲突）；已合入本页的旧题保持原位置不变。
+- [`docs/challenges/`](docs/challenges/)：浏览新增题解，每题一篇。
 
 ## 索引
 

@@ -2,7 +2,7 @@
 
 ## 仓库结构
 
-当前仓库建议保持轻量，题解正文保留在根 `README.md`，较长的专题学习笔记放到 `docs/`，完整代码放到 `solutions/`：
+当前仓库建议保持轻量，已合入的旧题正文保留在根 `README.md`，新增题解按每题一篇放到 `docs/challenges/`，专题学习笔记放到 `docs/`，完整代码放到 `solutions/`：
 
 ```text
 LeetGPU-Guidebook/
@@ -120,8 +120,8 @@ extern "C" void solve(const float* in, float* out, int n) {
 ## 新题添加流程
 
 ```text
-1. 在索引补一个锚点
-2. 在对应难度末尾新增题目小节
+1. 在 `docs/challenges/<题目名>.md` 新建独立题解（不改动根 `README.md`）
+2. 完整源码放到 `solutions/<type>/` 并在题解末尾链接
 3. 先写最小可讲清的版本
 4. 再决定是否补优化版本
 5. 最后检查是否有重复代码和重复解释
