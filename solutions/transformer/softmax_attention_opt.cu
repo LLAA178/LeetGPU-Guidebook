@@ -4,212 +4,227 @@
 
 namespace {
 
-constexpr int kBr = 16;
+constexpr int kBr = 8;
 constexpr int kBc = 32;
-constexpr int kThreads = 64;  // 8x8: ty in [0..7] (2 Q rows), tx in [0..7] (4 K cols / kOCols)
+constexpr int kThreads = 128;  // 8x16: ty in [0..7] (1 Q row), tx in [0..15] (2 K cols / float4 O cols)
 
-__device__ __forceinline__ float subwarp8_max(float val) {
+__device__ __forceinline__ float subwarp16_max(float val) {
     val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
     val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 2));
     val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 4));
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 8));
     return val;
 }
 
-__device__ __forceinline__ float subwarp8_sum(float val) {
+__device__ __forceinline__ float subwarp16_sum(float val) {
     val += __shfl_xor_sync(0xffffffff, val, 1);
     val += __shfl_xor_sync(0xffffffff, val, 2);
     val += __shfl_xor_sync(0xffffffff, val, 4);
+    val += __shfl_xor_sync(0xffffffff, val, 8);
     return val;
 }
 
-// 2D Register-Tiled FlashAttention (Br=16, Bc=32, 64 threads = 8x8):
-// Templated on kOCols so o_reg[2][kOCols] stays 100% in registers (0 stack frame).
-template <int kOCols>
-__global__ void __launch_bounds__(64, 2)
-softmax_attention_tiled2d_kernel(const float* __restrict__ Q,
-                                 const float* __restrict__ K,
-                                 const float* __restrict__ V,
-                                 float* __restrict__ output,
-                                 int M,
-                                 int N,
-                                 int d,
-                                 float scale) {
+// High-occupancy 8x16 (128-thread) float4-vectorized FlashAttention (Br=8, Bc=32):
+// 64 blocks for M=512 (100% of T4's 40 SMs active), 16 threads per Q row -> only 1-2 float4s
+// of O per thread (low register count, 0 spills, 22 KB smem -> 2 blocks/SM).
+template <int kVecCols>
+__global__ void __launch_bounds__(128, 2)
+softmax_attention_8x16_kernel(const float* __restrict__ Q,
+                              const float* __restrict__ K,
+                              const float* __restrict__ V,
+                              float* __restrict__ output,
+                              int M,
+                              int N,
+                              int d,
+                              float scale) {
     extern __shared__ float smem[];
-    const int d_stride = ((d + 3) & ~3) + 4;
-    float* sQ = smem;                         // 16 * d_stride
-    float* sKV = sQ + kBr * d_stride;         // 32 * d_stride (reused for K then V)
-    float* sP = sKV + kBc * d_stride;         // 16 * 36
+    const int d_stride = d + 4;
+    float* sQ = smem;
+    float* sKV = sQ + kBr * d_stride;
+    float* sP = sKV + kBc * d_stride;  // 8 * 36
 
     const int tid = threadIdx.x;
-    const int ty = tid >> 3;  // 0..7 -> 2 Q rows: ty*2, ty*2+1
-    const int tx = tid & 7;   // 0..7 -> 4 K cols: tx*4 .. tx*4+3
+    const int ty = tid >> 4;  // 0..7  -> 1 Q row
+    const int tx = tid & 15;  // 0..15 -> 2 K cols / float4 O chunks
     const int q_block_row = blockIdx.x * kBr;
     const int q_len = min(kBr, M - q_block_row);
-
-    const bool use_vec4 = ((d & 3) == 0);
     const int vec_d = d >> 2;
 
-    if (use_vec4) {
-        for (int idx = tid; idx < q_len * vec_d; idx += kThreads) {
-            const int r = idx / vec_d;
-            const int c4 = idx % vec_d;
-            float4 v = *reinterpret_cast<const float4*>(&Q[static_cast<size_t>(q_block_row + r) * d + c4 * 4]);
-            *reinterpret_cast<float4*>(&sQ[r * d_stride + c4 * 4]) =
-                make_float4(v.x * scale, v.y * scale, v.z * scale, v.w * scale);
-        }
-    } else {
-        for (int idx = tid; idx < q_len * d; idx += kThreads) {
-            const int r = idx / d;
-            const int c = idx % d;
-            sQ[r * d_stride + c] = Q[static_cast<size_t>(q_block_row + r) * d + c] * scale;
-        }
+    for (int idx = tid; idx < q_len * vec_d; idx += kThreads) {
+        const int r = idx / vec_d;
+        const int c4 = idx % vec_d;
+        float4 v = *reinterpret_cast<const float4*>(&Q[static_cast<size_t>(q_block_row + r) * d + c4 * 4]);
+        *reinterpret_cast<float4*>(&sQ[r * d_stride + c4 * 4]) =
+            make_float4(v.x * scale, v.y * scale, v.z * scale, v.w * scale);
     }
     __syncthreads();
 
-    float o_reg[2][kOCols];
+    float4 o_reg[kVecCols];
     #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        #pragma unroll
-        for (int c = 0; c < kOCols; ++c) {
-            o_reg[i][c] = 0.0f;
-        }
+    for (int c = 0; c < kVecCols; ++c) {
+        o_reg[c] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    float m[2] = {-FLT_MAX, -FLT_MAX};
-    float l[2] = {0.0f, 0.0f};
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    const bool valid_q = (ty < q_len);
 
     for (int k_start = 0; k_start < N; k_start += kBc) {
         const int kv_len = min(kBc, N - k_start);
 
-        if (use_vec4) {
-            for (int idx = tid; idx < kv_len * vec_d; idx += kThreads) {
-                const int r = idx / vec_d;
-                const int c4 = idx % vec_d;
-                *reinterpret_cast<float4*>(&sKV[r * d_stride + c4 * 4]) =
-                    *reinterpret_cast<const float4*>(&K[static_cast<size_t>(k_start + r) * d + c4 * 4]);
-            }
-        } else {
-            for (int idx = tid; idx < kv_len * d; idx += kThreads) {
-                const int r = idx / d;
-                const int c = idx % d;
-                sKV[r * d_stride + c] = K[static_cast<size_t>(k_start + r) * d + c];
-            }
+        for (int idx = tid; idx < kv_len * vec_d; idx += kThreads) {
+            const int r = idx / vec_d;
+            const int c4 = idx % vec_d;
+            *reinterpret_cast<float4*>(&sKV[r * d_stride + c4 * 4]) =
+                *reinterpret_cast<const float4*>(&K[static_cast<size_t>(k_start + r) * d + c4 * 4]);
         }
         __syncthreads();
 
-        // 1. Pure FMA S = Q @ K^T (2x4 per thread, float4 vectorized when d % 4 == 0)
-        float s_acc[2][4] = {{0.0f}};
-        if (use_vec4) {
+        // 1. Q @ K^T (1x2 per thread, float4 vectorized)
+        float s0 = 0.0f, s1 = 0.0f;
+        const int k0 = tx * 2;
+        const int k1 = k0 + 1;
+        if (valid_q) {
+            const float* q_row = &sQ[ty * d_stride];
             for (int k = 0; k < d; k += 4) {
-                float4 q0 = (ty * 2 + 0 < q_len)
-                                ? *reinterpret_cast<const float4*>(&sQ[(ty * 2 + 0) * d_stride + k])
-                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                float4 q1 = (ty * 2 + 1 < q_len)
-                                ? *reinterpret_cast<const float4*>(&sQ[(ty * 2 + 1) * d_stride + k])
-                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    if (tx * 4 + j < kv_len) {
-                        float4 kv = *reinterpret_cast<const float4*>(&sKV[(tx * 4 + j) * d_stride + k]);
-                        s_acc[0][j] = fmaf(q0.x, kv.x, fmaf(q0.y, kv.y, fmaf(q0.z, kv.z, fmaf(q0.w, kv.w, s_acc[0][j]))));
-                        s_acc[1][j] = fmaf(q1.x, kv.x, fmaf(q1.y, kv.y, fmaf(q1.z, kv.z, fmaf(q1.w, kv.w, s_acc[1][j]))));
-                    }
+                float4 qv = *reinterpret_cast<const float4*>(&q_row[k]);
+                if (k0 < kv_len) {
+                    float4 kv = *reinterpret_cast<const float4*>(&sKV[k0 * d_stride + k]);
+                    s0 = fmaf(qv.x, kv.x, fmaf(qv.y, kv.y, fmaf(qv.z, kv.z, fmaf(qv.w, kv.w, s0))));
                 }
-            }
-        } else {
-            for (int k = 0; k < d; ++k) {
-                float q0 = (ty * 2 + 0 < q_len) ? sQ[(ty * 2 + 0) * d_stride + k] : 0.0f;
-                float q1 = (ty * 2 + 1 < q_len) ? sQ[(ty * 2 + 1) * d_stride + k] : 0.0f;
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    float kv = (tx * 4 + j < kv_len) ? sKV[(tx * 4 + j) * d_stride + k] : 0.0f;
-                    s_acc[0][j] = fmaf(q0, kv, s_acc[0][j]);
-                    s_acc[1][j] = fmaf(q1, kv, s_acc[1][j]);
+                if (k1 < kv_len) {
+                    float4 kv = *reinterpret_cast<const float4*>(&sKV[k1 * d_stride + k]);
+                    s1 = fmaf(qv.x, kv.x, fmaf(qv.y, kv.y, fmaf(qv.z, kv.z, fmaf(qv.w, kv.w, s1))));
                 }
             }
         }
 
-        // 2. 8-thread sub-warp Online Softmax + write P to sP
+        // 2. 16-thread sub-warp Online Softmax
+        float rmax = -FLT_MAX;
+        if (k0 < kv_len) rmax = fmaxf(rmax, s0);
+        if (k1 < kv_len) rmax = fmaxf(rmax, s1);
+
+        float tile_max = subwarp16_max(rmax);
+        float m_new = fmaxf(m, tile_max);
+        float alpha = __expf(m - m_new);
+
+        float p0 = (k0 < kv_len) ? __expf(s0 - m_new) : 0.0f;
+        float p1 = (k1 < kv_len) ? __expf(s1 - m_new) : 0.0f;
+
+        *reinterpret_cast<float2*>(&sP[ty * 36 + k0]) = make_float2(p0, p1);
+        float tile_sum = subwarp16_sum(p0 + p1);
+        l = l * alpha + tile_sum;
+        m = m_new;
+
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            float rmax = -FLT_MAX;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                if (tx * 4 + j < kv_len) {
-                    rmax = fmaxf(rmax, s_acc[i][j]);
-                }
-            }
-            float tile_max = subwarp8_max(rmax);
-            float m_new = fmaxf(m[i], tile_max);
-            float alpha = __expf(m[i] - m_new);
-
-            float rsum = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                float p = (tx * 4 + j < kv_len) ? __expf(s_acc[i][j] - m_new) : 0.0f;
-                sP[(ty * 2 + i) * 36 + (tx * 4 + j)] = p;
-                rsum += p;
-            }
-            float tile_sum = subwarp8_sum(rsum);
-            l[i] = l[i] * alpha + tile_sum;
-            m[i] = m_new;
-
-            #pragma unroll
-            for (int c = 0; c < kOCols; ++c) {
-                o_reg[i][c] *= alpha;
-            }
+        for (int c = 0; c < kVecCols; ++c) {
+            o_reg[c].x *= alpha;
+            o_reg[c].y *= alpha;
+            o_reg[c].z *= alpha;
+            o_reg[c].w *= alpha;
         }
         __syncthreads();
 
         // 3. Load V tile into sKV
-        if (use_vec4) {
-            for (int idx = tid; idx < kv_len * vec_d; idx += kThreads) {
-                const int r = idx / vec_d;
-                const int c4 = idx % vec_d;
-                *reinterpret_cast<float4*>(&sKV[r * d_stride + c4 * 4]) =
-                    *reinterpret_cast<const float4*>(&V[static_cast<size_t>(k_start + r) * d + c4 * 4]);
-            }
-        } else {
-            for (int idx = tid; idx < kv_len * d; idx += kThreads) {
-                const int r = idx / d;
-                const int c = idx % d;
-                sKV[r * d_stride + c] = V[static_cast<size_t>(k_start + r) * d + c];
-            }
+        for (int idx = tid; idx < kv_len * vec_d; idx += kThreads) {
+            const int r = idx / vec_d;
+            const int c4 = idx % vec_d;
+            *reinterpret_cast<float4*>(&sKV[r * d_stride + c4 * 4]) =
+                *reinterpret_cast<const float4*>(&V[static_cast<size_t>(k_start + r) * d + c4 * 4]);
         }
         __syncthreads();
 
-        // 4. Pure FMA O += P @ V
-        for (int j = 0; j < kv_len; ++j) {
-            float p0 = sP[(ty * 2 + 0) * 36 + j];
-            float p1 = sP[(ty * 2 + 1) * 36 + j];
-            const float* v_row = &sKV[j * d_stride];
-            #pragma unroll
-            for (int c = 0; c < kOCols; ++c) {
-                const int col = tx + c * 8;
-                if (col < d) {
-                    float vv = v_row[col];
-                    o_reg[0][c] = fmaf(p0, vv, o_reg[0][c]);
-                    o_reg[1][c] = fmaf(p1, vv, o_reg[1][c]);
+        // 4. float4-vectorized P @ V (only 1-2 float4s per thread!)
+        if (valid_q) {
+            const float* p_row = &sP[ty * 36];
+            for (int j = 0; j < kv_len; ++j) {
+                float p = p_row[j];
+                const float* v_row = &sKV[j * d_stride];
+                #pragma unroll
+                for (int c = 0; c < kVecCols; ++c) {
+                    const int col = tx * 4 + c * 64;
+                    if (col < d) {
+                        float4 vv = *reinterpret_cast<const float4*>(&v_row[col]);
+                        o_reg[c].x = fmaf(p, vv.x, o_reg[c].x);
+                        o_reg[c].y = fmaf(p, vv.y, o_reg[c].y);
+                        o_reg[c].z = fmaf(p, vv.z, o_reg[c].z);
+                        o_reg[c].w = fmaf(p, vv.w, o_reg[c].w);
+                    }
                 }
             }
         }
         __syncthreads();
     }
 
-    #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int qr = q_block_row + ty * 2 + i;
-        if (qr < M) {
-            float* o_ptr = output + static_cast<size_t>(qr) * d;
-            const float inv_l = 1.0f / l[i];
-            #pragma unroll
-            for (int c = 0; c < kOCols; ++c) {
-                const int col = tx + c * 8;
-                if (col < d) {
-                    o_ptr[col] = o_reg[i][c] * inv_l;
-                }
+    if (valid_q) {
+        float* o_ptr = output + static_cast<size_t>(q_block_row + ty) * d;
+        const float inv_l = 1.0f / l;
+        #pragma unroll
+        for (int c = 0; c < kVecCols; ++c) {
+            const int col = tx * 4 + c * 64;
+            if (col < d) {
+                *reinterpret_cast<float4*>(&o_ptr[col]) = make_float4(
+                    o_reg[c].x * inv_l, o_reg[c].y * inv_l, o_reg[c].z * inv_l, o_reg[c].w * inv_l);
             }
         }
+    }
+}
+
+// General fallback for d % 4 != 0
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__global__ void softmax_attention_fallback_kernel(const float* __restrict__ Q,
+                                                  const float* __restrict__ K,
+                                                  const float* __restrict__ V,
+                                                  float* __restrict__ output,
+                                                  int M,
+                                                  int N,
+                                                  int d,
+                                                  float scale) {
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int q_row = blockIdx.x * 4 + warp_id;
+    if (q_row >= M) return;
+
+    const float* q_ptr = Q + static_cast<size_t>(q_row) * d;
+    float q_reg[4], o_reg[4];
+    const int elems = (d + 31) >> 5;
+    for (int i = 0; i < elems; ++i) {
+        const int col = lane + i * 32;
+        q_reg[i] = (col < d) ? q_ptr[col] * scale : 0.0f;
+        o_reg[i] = 0.0f;
+    }
+    float m = -FLT_MAX, l = 0.0f;
+    for (int k_row = 0; k_row < N; ++k_row) {
+        const float* k_ptr = K + static_cast<size_t>(k_row) * d;
+        float dot = 0.0f;
+        for (int i = 0; i < elems; ++i) {
+            const int col = lane + i * 32;
+            if (col < d) dot = fmaf(q_reg[i], k_ptr[col], dot);
+        }
+        float score = __shfl_sync(0xffffffff, warp_reduce_sum(dot), 0);
+        float m_new = fmaxf(m, score);
+        float alpha = __expf(m - m_new);
+        float p = __expf(score - m_new);
+        l = l * alpha + p;
+        const float* v_ptr = V + static_cast<size_t>(k_row) * d;
+        for (int i = 0; i < elems; ++i) {
+            const int col = lane + i * 32;
+            if (col < d) o_reg[i] = fmaf(p, v_ptr[col], o_reg[i] * alpha);
+        }
+        m = m_new;
+    }
+    float* o_ptr = output + static_cast<size_t>(q_row) * d;
+    const float inv_l = 1.0f / l;
+    for (int i = 0; i < elems; ++i) {
+        const int col = lane + i * 32;
+        if (col < d) o_ptr[col] = o_reg[i] * inv_l;
     }
 }
 
@@ -217,19 +232,20 @@ softmax_attention_tiled2d_kernel(const float* __restrict__ Q,
 
 extern "C" void solve(const float* Q, const float* K, const float* V, float* output, int M, int N,
                       int d) {
-    dim3 block(kThreads);
-    dim3 grid((M + kBr - 1) / kBr);
-    const int d_stride = ((d + 3) & ~3) + 4;
-    const size_t smem_bytes = (static_cast<size_t>(kBr + kBc) * d_stride + kBr * 36ULL) * sizeof(float);
     const float scale = rsqrtf(static_cast<float>(d));
-
-    if (d <= 32) {
-        softmax_attention_tiled2d_kernel<4><<<grid, block, smem_bytes>>>(Q, K, V, output, M, N, d, scale);
-    } else if (d <= 64) {
-        softmax_attention_tiled2d_kernel<8><<<grid, block, smem_bytes>>>(Q, K, V, output, M, N, d, scale);
-    } else if (d <= 96) {
-        softmax_attention_tiled2d_kernel<12><<<grid, block, smem_bytes>>>(Q, K, V, output, M, N, d, scale);
-    } else {
-        softmax_attention_tiled2d_kernel<16><<<grid, block, smem_bytes>>>(Q, K, V, output, M, N, d, scale);
+    if ((d & 3) == 0) {
+        dim3 block(kThreads);
+        dim3 grid((M + kBr - 1) / kBr);
+        const int d_stride = d + 4;
+        const size_t smem_bytes = (static_cast<size_t>(kBr + kBc) * d_stride + kBr * 36ULL) * sizeof(float);
+        if (d <= 64) {
+            softmax_attention_8x16_kernel<1><<<grid, block, smem_bytes>>>(Q, K, V, output, M, N, d, scale);
+        } else {
+            softmax_attention_8x16_kernel<2><<<grid, block, smem_bytes>>>(Q, K, V, output, M, N, d, scale);
+        }
+        return;
     }
+    dim3 block(128);
+    dim3 grid((M + 3) / 4);
+    softmax_attention_fallback_kernel<<<grid, block>>>(Q, K, V, output, M, N, d, scale);
 }
