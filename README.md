@@ -2006,9 +2006,9 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 1. **设备端按组划分行块（Tile，分块），省掉主机同步**：因为 `G <= 64`，每个线程块（Block）在核函数开头直接扫描 `group_offsets` 把 `blockIdx.y` 映射到唯一的 `(group_id, local_tile_m)`，保证同一线程块只算同一组的数据，既不需要把 `group_offsets` 拷回 CPU，也不需要为每组单独启动核函数。
 2. **共享内存（Shared Memory）双缓冲 + `float4` 向量化访存 + 每线程 `8×8` 寄存器微块**：每个 `256` 线程的块负责 `128×128` 输出块，沿 `K` 维以 `BK = 8` 推进；在计算当前缓冲块的同时预取下一块到寄存器，把大量重复的显存访问压缩为片上寄存器复用；对 `K % 8 != 0` 或 `N % 4 != 0` 的非对齐形状自动回退到通用 `16×16` 共享内存分块核函数。
 
-在官方性能形状 `G = 8, M_total = 8192, K = 1024, N = 2048`（不均衡分组，FP32）上的本地 GPU 实测结果：
-- Baseline：`74.298 ms`（`462.46 GFLOP/s`）
-- Opt：`7.635 ms`（`4500.32 GFLOP/s`，相对 Baseline 加速 **9.73x**，与 Baseline 最大误差 `0.00e+00`）
+在官方性能形状 `G = 8, M_total = 8192, K = 1024, N = 2048`（不均衡分组，FP32）上的实测结果：
+- 本地 GPU 对比：Baseline `74.298 ms`（`462.46 GFLOP/s`）→ Opt `7.635 ms`（`4500.32 GFLOP/s`，加速 **9.73x**，与 Baseline 最大误差 `0.00e+00`）
+- LeetGPU 平台提交（T4）：**13.44 ms，第 90.5 百分位**
 
 完整代码：
 - 基础版：[`solutions/matmul/grouped_gemm_baseline.cu`](./solutions/matmul/grouped_gemm_baseline.cu)
