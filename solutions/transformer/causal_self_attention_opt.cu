@@ -4,9 +4,9 @@
 
 namespace {
 
-constexpr int kBr = 32;
+constexpr int kBr = 64;
 constexpr int kBc = 32;
-constexpr int kThreads = 128;  // 8x16: ty in [0..7] (4 Q rows/thread), tx in [0..15] (2 K cols / float4 O cols)
+constexpr int kThreads = 256;  // 16x16: ty in [0..15] (4 Q rows/thread), tx in [0..15] (2 K cols / float4 O cols)
 
 __device__ __forceinline__ float subwarp16_max(float val) {
     val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
@@ -24,13 +24,14 @@ __device__ __forceinline__ float subwarp16_sum(float val) {
     return val;
 }
 
-// High-reuse 8x16 (128-thread) float4-vectorized FlashAttention (Br=32, Bc=32):
-// - Each thread owns 4 Q rows -> 4x register reuse of every K/V float4 loaded from smem.
-// - Reverse block scheduling launches heaviest causal blocks first to eliminate tail imbalance.
-// - Interior tiles (k_start + Bc - 1 <= q_block_row) run branch-free without causal mask checks.
+// High-reuse 16x16 (256-thread, 8-warp) float4-vectorized FlashAttention (Br=64, Bc=32):
+// - 59.9 KB dynamic shared memory (fits in 64 KB on sm_75+).
+// - 64 Q rows share each K/V global load (2x less K/V gmem traffic than Br=32).
+// - 8 warps/SM hide LDS & math latency; float4 loads from sP cut P-matrix LDS by 4x.
+// - Reverse block scheduling + branch-free interior tiles.
 template <int kVecCols>
-__global__ void __launch_bounds__(128, 1)
-causal_self_attention_br32_kernel(const float* __restrict__ Q,
+__global__ void __launch_bounds__(256, 1)
+causal_self_attention_br64_kernel(const float* __restrict__ Q,
                                   const float* __restrict__ K,
                                   const float* __restrict__ V,
                                   float* __restrict__ output,
@@ -41,10 +42,10 @@ causal_self_attention_br32_kernel(const float* __restrict__ Q,
     const int d_stride = d + 4;
     float* sQ = smem;
     float* sKV = sQ + kBr * d_stride;
-    float* sP = sKV + kBc * d_stride;  // 32 * 36
+    float* sP = sKV + kBc * d_stride;  // 64 * 36
 
     const int tid = threadIdx.x;
-    const int ty = tid >> 4;  // 0..7  -> 4 Q rows (ty*4 .. ty*4+3)
+    const int ty = tid >> 4;  // 0..15 -> 4 Q rows (ty*4 .. ty*4+3)
     const int tx = tid & 15;  // 0..15 -> 2 K cols / float4 O chunks
 
     // Reverse block scheduling: heaviest blocks (largest q_block_row) launch first.
@@ -99,7 +100,6 @@ causal_self_attention_br32_kernel(const float* __restrict__ Q,
         float s1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
         if (is_full_tile) {
-            // Fast path: interior tile, zero causal mask branches.
             for (int k = 0; k < d; k += 4) {
                 float4 kv0 = *reinterpret_cast<const float4*>(&sKV[k0 * d_stride + k]);
                 float4 kv1 = *reinterpret_cast<const float4*>(&sKV[k1 * d_stride + k]);
@@ -131,7 +131,6 @@ causal_self_attention_br32_kernel(const float* __restrict__ Q,
                 }
             }
         } else {
-            // Diagonal / boundary tile: apply causal mask j <= q_row.
             const bool k0_in = (k0 < kv_len);
             const bool k1_in = (k1 < kv_len);
             for (int k = 0; k < d; k += 4) {
@@ -191,38 +190,72 @@ causal_self_attention_br32_kernel(const float* __restrict__ Q,
         }
         __syncthreads();
 
-        // P @ V: 4x register reuse of every V float4 across 4 Q rows
-        #pragma unroll 4
-        for (int j = 0; j < kv_len; ++j) {
-            const float p0 = sP[(r_base + 0) * 36 + j];
-            const float p1 = sP[(r_base + 1) * 36 + j];
-            const float p2 = sP[(r_base + 2) * 36 + j];
-            const float p3 = sP[(r_base + 3) * 36 + j];
-            const float* v_row = &sKV[j * d_stride];
-            #pragma unroll
-            for (int c = 0; c < kVecCols; ++c) {
-                const int col = tx * 4 + c * 64;
-                if (col < d) {
-                    float4 vv = *reinterpret_cast<const float4*>(&v_row[col]);
-                    o_reg[0][c].x = fmaf(p0, vv.x, o_reg[0][c].x);
-                    o_reg[0][c].y = fmaf(p0, vv.y, o_reg[0][c].y);
-                    o_reg[0][c].z = fmaf(p0, vv.z, o_reg[0][c].z);
-                    o_reg[0][c].w = fmaf(p0, vv.w, o_reg[0][c].w);
+        // P @ V: float4-vectorized sP loads (4x fewer sP LDS) + 4x V register reuse
+        if (kv_len == kBc) {
+            for (int j = 0; j < kBc; j += 4) {
+                float4 pv0 = *reinterpret_cast<const float4*>(&sP[(r_base + 0) * 36 + j]);
+                float4 pv1 = *reinterpret_cast<const float4*>(&sP[(r_base + 1) * 36 + j]);
+                float4 pv2 = *reinterpret_cast<const float4*>(&sP[(r_base + 2) * 36 + j]);
+                float4 pv3 = *reinterpret_cast<const float4*>(&sP[(r_base + 3) * 36 + j]);
 
-                    o_reg[1][c].x = fmaf(p1, vv.x, o_reg[1][c].x);
-                    o_reg[1][c].y = fmaf(p1, vv.y, o_reg[1][c].y);
-                    o_reg[1][c].z = fmaf(p1, vv.z, o_reg[1][c].z);
-                    o_reg[1][c].w = fmaf(p1, vv.w, o_reg[1][c].w);
+                const float ps[4][4] = {
+                    {pv0.x, pv1.x, pv2.x, pv3.x},
+                    {pv0.y, pv1.y, pv2.y, pv3.y},
+                    {pv0.z, pv1.z, pv2.z, pv3.z},
+                    {pv0.w, pv1.w, pv2.w, pv3.w},
+                };
 
-                    o_reg[2][c].x = fmaf(p2, vv.x, o_reg[2][c].x);
-                    o_reg[2][c].y = fmaf(p2, vv.y, o_reg[2][c].y);
-                    o_reg[2][c].z = fmaf(p2, vv.z, o_reg[2][c].z);
-                    o_reg[2][c].w = fmaf(p2, vv.w, o_reg[2][c].w);
+                #pragma unroll
+                for (int jj = 0; jj < 4; ++jj) {
+                    const float* v_row = &sKV[(j + jj) * d_stride];
+                    #pragma unroll
+                    for (int c = 0; c < kVecCols; ++c) {
+                        const int col = tx * 4 + c * 64;
+                        if (col < d) {
+                            float4 vv = *reinterpret_cast<const float4*>(&v_row[col]);
+                            #pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                o_reg[i][c].x = fmaf(ps[jj][i], vv.x, o_reg[i][c].x);
+                                o_reg[i][c].y = fmaf(ps[jj][i], vv.y, o_reg[i][c].y);
+                                o_reg[i][c].z = fmaf(ps[jj][i], vv.z, o_reg[i][c].z);
+                                o_reg[i][c].w = fmaf(ps[jj][i], vv.w, o_reg[i][c].w);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int j = 0; j < kv_len; ++j) {
+                const float p0 = sP[(r_base + 0) * 36 + j];
+                const float p1 = sP[(r_base + 1) * 36 + j];
+                const float p2 = sP[(r_base + 2) * 36 + j];
+                const float p3 = sP[(r_base + 3) * 36 + j];
+                const float* v_row = &sKV[j * d_stride];
+                #pragma unroll
+                for (int c = 0; c < kVecCols; ++c) {
+                    const int col = tx * 4 + c * 64;
+                    if (col < d) {
+                        float4 vv = *reinterpret_cast<const float4*>(&v_row[col]);
+                        o_reg[0][c].x = fmaf(p0, vv.x, o_reg[0][c].x);
+                        o_reg[0][c].y = fmaf(p0, vv.y, o_reg[0][c].y);
+                        o_reg[0][c].z = fmaf(p0, vv.z, o_reg[0][c].z);
+                        o_reg[0][c].w = fmaf(p0, vv.w, o_reg[0][c].w);
 
-                    o_reg[3][c].x = fmaf(p3, vv.x, o_reg[3][c].x);
-                    o_reg[3][c].y = fmaf(p3, vv.y, o_reg[3][c].y);
-                    o_reg[3][c].z = fmaf(p3, vv.z, o_reg[3][c].z);
-                    o_reg[3][c].w = fmaf(p3, vv.w, o_reg[3][c].w);
+                        o_reg[1][c].x = fmaf(p1, vv.x, o_reg[1][c].x);
+                        o_reg[1][c].y = fmaf(p1, vv.y, o_reg[1][c].y);
+                        o_reg[1][c].z = fmaf(p1, vv.z, o_reg[1][c].z);
+                        o_reg[1][c].w = fmaf(p1, vv.w, o_reg[1][c].w);
+
+                        o_reg[2][c].x = fmaf(p2, vv.x, o_reg[2][c].x);
+                        o_reg[2][c].y = fmaf(p2, vv.y, o_reg[2][c].y);
+                        o_reg[2][c].z = fmaf(p2, vv.z, o_reg[2][c].z);
+                        o_reg[2][c].w = fmaf(p2, vv.w, o_reg[2][c].w);
+
+                        o_reg[3][c].x = fmaf(p3, vv.x, o_reg[3][c].x);
+                        o_reg[3][c].y = fmaf(p3, vv.y, o_reg[3][c].y);
+                        o_reg[3][c].z = fmaf(p3, vv.z, o_reg[3][c].z);
+                        o_reg[3][c].w = fmaf(p3, vv.w, o_reg[3][c].w);
+                    }
                 }
             }
         }
@@ -315,9 +348,19 @@ extern "C" void solve(const float* Q, const float* K, const float* V, float* out
         const size_t smem_bytes =
             (static_cast<size_t>(kBr + kBc) * d_stride + kBr * 36ULL) * sizeof(float);
         if (d <= 64) {
-            causal_self_attention_br32_kernel<1><<<grid, block, smem_bytes>>>(Q, K, V, output, M, d, scale);
+            if (smem_bytes > 49152) {
+                cudaFuncSetAttribute(causal_self_attention_br64_kernel<1>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     static_cast<int>(smem_bytes));
+            }
+            causal_self_attention_br64_kernel<1><<<grid, block, smem_bytes>>>(Q, K, V, output, M, d, scale);
         } else {
-            causal_self_attention_br32_kernel<2><<<grid, block, smem_bytes>>>(Q, K, V, output, M, d, scale);
+            if (smem_bytes > 49152) {
+                cudaFuncSetAttribute(causal_self_attention_br64_kernel<2>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     static_cast<int>(smem_bytes));
+            }
+            causal_self_attention_br64_kernel<2><<<grid, block, smem_bytes>>>(Q, K, V, output, M, d, scale);
         }
         return;
     }

@@ -2254,7 +2254,7 @@ for (int k_row = 0; k_row <= q_row; ++k_row) {
 
 > optimized
 
-baseline 里每个 warp 每次只算一行 `Q`，`K` 和 `V` 都要反复从 global memory（全局显存）读；优化版改用 FlashAttention 分块思路：一个 128 线程的 block（线程块，组织成 `8×16`）一次处理 `Br=32` 行 `Q`，每个线程同时维护 4 行 `Q` 的累加器，每次把 `Bc=32` 行 `K` 或 `V` 搬进 shared memory（片上共享内存，速度远快于全局显存）复用，并用 `float4`（一次读写 4 个 `float` 的 128 位向量指令）加速访存。同时利用因果掩码做了三处优化：
+baseline 里每个 warp 每次只算一行 `Q`，`K` 和 `V` 都要反复从 global memory（全局显存）读；优化版改用 FlashAttention 分块思路：一个 256 线程的 block（线程块，组织成 `16×16`、共 8 个 warp）一次处理 `Br=64` 行 `Q`，每个线程同时维护 4 行 `Q` 的累加器，每次把 `Bc=32` 行 `K` 或 `V` 搬进 shared memory（片上共享内存，速度远快于全局显存）复用，并用 `float4`（一次读写 4 个 `float` 的 128 位向量指令）加速 `Q/K/V` 与中间权重表 `sP` 的访存。同时利用因果掩码做了三处优化：
 - **外层分块提前终止**：当 `k_start > q_max_row` 时直接结束循环，整块跳过上三角的无效 `K/V` 搬运与计算。
 - **内部完整分块无分支路径**：当 `k_start + Bc - 1 <= q_block_row` 时，整个分块全部位于下三角，去掉内层逐元素掩码判断。
 - **逆序 block 调度**：从最大的查询行分块开始发射，让计算量最重的 block 先跑，消除尾部波次的负载不均衡。
@@ -2265,14 +2265,14 @@ for (int k_start = 0; k_start <= q_max_row; k_start += kBc) {
     // 1. float4 协作加载 K 分块到 shared memory
     // 2. 内部完整分块走无分支路径，对角分块施加 j <= q_row 掩码；每份 K float4 复用 4 行 Q
     // 3. 16 线程子束内用 shuffle 归约完成 Online Softmax，写回 sP
-    // 4. float4 协作加载 V 分块到 shared memory，每份 V float4 复用 4 行 Q 累加到寄存器
+    // 4. float4 协作加载 V 分块到 shared memory，float4 读取 sP 并把每份 V float4 复用 4 行 Q
 }
 ```
 
 > 省了哪一步与实测效果
-- **4 倍片上数据复用**：每个线程同时算 4 行 `Q`，每次从共享内存读出的 `K/V` `float4` 都直接复用 4 次，大幅缓解片上访存瓶颈。
+- **64 行共享片上分块 + 4 倍寄存器复用**：64 行 `Q` 共享同一份片上 `K/V` 分块，每个线程同时算 4 行 `Q`，并按 4 个元素一组用 `float4` 读 `sP`，大幅降低全局显存与片上访存压力。
 - **因果剪枝与负载均衡**：按块跳过上三角分块、内部块去分支、逆序发射重负载 block，减少无效计算与尾部等待。
-- **本地实测**：在 `M=5000, d=64` 上，优化版从 `15.323 ms` 降到 `1.657 ms`（提速 `9.25x`）；在 `M=5000, d=128` 上，从 `22.766 ms` 降到 `3.395 ms`（提速 `6.71x`），数值误差均小于 `5e-7`。
+- **本地实测**：在 `M=5000, d=64` 上，优化版从 `15.323 ms` 降到 `1.526 ms`（提速 `10.04x`）；在 `M=5000, d=128` 上，从 `22.766 ms` 降到 `2.693 ms`（提速 `8.45x`），数值误差均小于 `5e-7`。
 
 完整代码：
 - baseline：[`solutions/transformer/causal_self_attention_baseline.cu`](./solutions/transformer/causal_self_attention_baseline.cu)
