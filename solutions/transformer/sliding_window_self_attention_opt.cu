@@ -25,6 +25,190 @@ __device__ __forceinline__ float halfwarp_reduce_sum(unsigned mask, float val) {
   return val;
 }
 
+__device__ __forceinline__ float subwarp8_reduce_sum(float val) {
+#pragma unroll
+  for (int offset = 4; offset > 0; offset >>= 1) {
+    val += __shfl_xor_sync(0xffffffffu, val, offset);
+  }
+  return val;
+}
+
+// Single-load zero-loop shared-window fast path for d <= 64, d % 4 == 0, W <= 16:
+// - Br = 32 query rows per block (256 threads = 32 sub-warps of 8 threads).
+// - Entire block's KV window (<= 32 + 2*16 = 64 rows) is loaded ONCE into
+//   shared memory (32 KB total) with float4, followed by ONE __syncthreads().
+// - Each 8-thread sub-warp owns 1 query row (2 float4s per thread = 8 floats).
+// - Pass 1 computes all <= 33 scores in registers using 3-shuffle subwarp8
+//   reduction and tracks max_s.
+// - Pass 2 computes exp2f(score - max_s) once per key and accumulates P @ V
+//   directly with ZERO output rescaling.
+constexpr int kFastBr = 32;
+constexpr int kFastMaxKV = 64;
+constexpr int kFastMaxWin = 33;  // 2 * 16 + 1
+constexpr int kFastThreads = 256;
+
+__global__ void __launch_bounds__(kFastThreads, 2)
+sliding_window_attn_fast_d64_w16_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ output,
+    int M,
+    int d,
+    int window_size) {
+  __shared__ float4 sK[kFastMaxKV][16];
+  __shared__ float4 sV[kFastMaxKV][16];
+
+  int tid = threadIdx.x;
+  int d4 = d >> 2;
+  int block_q_start = blockIdx.x * kFastBr;
+  int block_q_end = block_q_start + kFastBr - 1;
+  if (block_q_end >= M) block_q_end = M - 1;
+
+  int kv_start = block_q_start - window_size;
+  if (kv_start < 0) kv_start = 0;
+  int kv_end = block_q_end + window_size;
+  if (kv_end >= M) kv_end = M - 1;
+  int kv_len = kv_end - kv_start + 1;
+
+  const float4* Q4 = reinterpret_cast<const float4*>(Q);
+  const float4* K4 = reinterpret_cast<const float4*>(K);
+  const float4* V4 = reinterpret_cast<const float4*>(V);
+  float4* O4 = reinterpret_cast<float4*>(output);
+
+  // Single cooperative float4 load of the entire block's K and V window.
+  int total_vecs = kv_len * d4;
+  if (d4 == 16) {
+    for (int idx = tid; idx < total_vecs; idx += kFastThreads) {
+      int r = idx >> 4;
+      int c = idx & 15;
+      int g_row = kv_start + r;
+      sK[r][c] = K4[g_row * 16 + c];
+      sV[r][c] = V4[g_row * 16 + c];
+    }
+  } else {
+    for (int idx = tid; idx < total_vecs; idx += kFastThreads) {
+      int r = idx / d4;
+      int c = idx - r * d4;
+      int g_row = kv_start + r;
+      sK[r][c] = K4[g_row * d4 + c];
+      sV[r][c] = V4[g_row * d4 + c];
+    }
+  }
+  __syncthreads();
+
+  int row_in_block = tid >> 3;  // 0..31
+  int tx = tid & 7;             // 0..7
+  int qr = block_q_start + row_in_block;
+  bool valid_row = (qr < M);
+  int safe_qr = valid_row ? qr : (M - 1);
+
+  float scale_log2e = rsqrtf(static_cast<float>(d)) * kLog2E;
+
+  float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  float4 q1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  if (tx < d4) {
+    float4 v0 = Q4[safe_qr * d4 + tx];
+    q0 = make_float4(v0.x * scale_log2e, v0.y * scale_log2e,
+                     v0.z * scale_log2e, v0.w * scale_log2e);
+  }
+  if (tx + 8 < d4) {
+    float4 v1 = Q4[safe_qr * d4 + (tx + 8)];
+    q1 = make_float4(v1.x * scale_log2e, v1.y * scale_log2e,
+                     v1.z * scale_log2e, v1.w * scale_log2e);
+  }
+
+  int j_lo = safe_qr - window_size - kv_start;
+  if (j_lo < 0) j_lo = 0;
+  int j_hi = safe_qr + window_size - kv_start;
+  if (j_hi >= kv_len) j_hi = kv_len - 1;
+  int win_len = j_hi - j_lo + 1;
+
+  float scores[kFastMaxWin];
+  float max_s = -INFINITY;
+  float sum_p = 0.0f;
+  float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  float4 o1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+  if (d4 == 16 && win_len == 33) {
+    // Hot path for M=5000, d=64, W=16 interior rows (99.4% of rows):
+    // compile-time unroll keeps scores[33] in registers with 0 stack frame.
+#pragma unroll
+    for (int k = 0; k < 33; ++k) {
+      int j = j_lo + k;
+      float4 k0 = sK[j][tx];
+      float4 k1 = sK[j][tx + 8];
+      float dot = fmaf(q0.x, k0.x, fmaf(q0.y, k0.y, fmaf(q0.z, k0.z, q0.w * k0.w)));
+      dot = fmaf(q1.x, k1.x, fmaf(q1.y, k1.y, fmaf(q1.z, k1.z, fmaf(q1.w, k1.w, dot))));
+      float s = subwarp8_reduce_sum(dot);
+      scores[k] = s;
+      max_s = fmaxf(max_s, s);
+    }
+#pragma unroll
+    for (int k = 0; k < 33; ++k) {
+      int j = j_lo + k;
+      float p = exp2f(scores[k] - max_s);
+      sum_p += p;
+      float4 v0 = sV[j][tx];
+      float4 v1 = sV[j][tx + 8];
+      o0.x = fmaf(p, v0.x, o0.x);
+      o0.y = fmaf(p, v0.y, o0.y);
+      o0.z = fmaf(p, v0.z, o0.z);
+      o0.w = fmaf(p, v0.w, o0.w);
+      o1.x = fmaf(p, v1.x, o1.x);
+      o1.y = fmaf(p, v1.y, o1.y);
+      o1.z = fmaf(p, v1.z, o1.z);
+      o1.w = fmaf(p, v1.w, o1.w);
+    }
+  } else {
+    // Boundary rows or smaller d/W: online softmax (0 stack frame).
+    for (int k = 0; k < win_len; ++k) {
+      int j = j_lo + k;
+      float dot = 0.0f;
+      if (tx < d4) {
+        float4 k0 = sK[j][tx];
+        dot = fmaf(q0.x, k0.x, fmaf(q0.y, k0.y, fmaf(q0.z, k0.z, q0.w * k0.w)));
+      }
+      if (tx + 8 < d4) {
+        float4 k1 = sK[j][tx + 8];
+        dot = fmaf(q1.x, k1.x, fmaf(q1.y, k1.y, fmaf(q1.z, k1.z, fmaf(q1.w, k1.w, dot))));
+      }
+      float s = subwarp8_reduce_sum(dot);
+      float m_new = fmaxf(max_s, s);
+      float alpha = exp2f(max_s - m_new);
+      float beta = exp2f(s - m_new);
+      sum_p = fmaf(sum_p, alpha, beta);
+      max_s = m_new;
+      if (tx < d4) {
+        float4 v0 = sV[j][tx];
+        o0.x = fmaf(o0.x, alpha, beta * v0.x);
+        o0.y = fmaf(o0.y, alpha, beta * v0.y);
+        o0.z = fmaf(o0.z, alpha, beta * v0.z);
+        o0.w = fmaf(o0.w, alpha, beta * v0.w);
+      }
+      if (tx + 8 < d4) {
+        float4 v1 = sV[j][tx + 8];
+        o1.x = fmaf(o1.x, alpha, beta * v1.x);
+        o1.y = fmaf(o1.y, alpha, beta * v1.y);
+        o1.z = fmaf(o1.z, alpha, beta * v1.z);
+        o1.w = fmaf(o1.w, alpha, beta * v1.w);
+      }
+    }
+  }
+
+  if (valid_row) {
+    float inv_sum = 1.0f / sum_p;
+    if (tx < d4) {
+      O4[qr * d4 + tx] = make_float4(
+          o0.x * inv_sum, o0.y * inv_sum, o0.z * inv_sum, o0.w * inv_sum);
+    }
+    if (tx + 8 < d4) {
+      O4[qr * d4 + (tx + 8)] = make_float4(
+          o1.x * inv_sum, o1.y * inv_sum, o1.z * inv_sum, o1.w * inv_sum);
+    }
+  }
+}
+
 // General fallback for d % 4 != 0 or unaligned pointers.
 __global__ void sliding_window_attn_fallback_kernel(
     const float* __restrict__ Q,
@@ -373,7 +557,12 @@ extern "C" void solve(const float* Q, const float* K, const float* V,
       ((reinterpret_cast<uintptr_t>(output) & 15) == 0);
 
   if ((d & 3) == 0 && aligned16) {
-    if (d <= 64) {
+    if (d <= 64 && window_size <= 16) {
+      int grid = (M + kFastBr - 1) / kFastBr;
+      sliding_window_attn_fast_d64_w16_kernel<<<grid, kFastThreads>>>(
+          Q, K, V, output, M, d, window_size);
+      return;
+    } else if (d <= 64) {
       int grid = (M + kBr64 - 1) / kBr64;
       sliding_window_attn_opt_d64_kernel<<<grid, kThreads64>>>(
           Q, K, V, output, M, d, window_size);

@@ -2238,14 +2238,14 @@ __global__ void attn(const float* qkv, float* output, const float* weights, int 
 **省了哪一步（核心优化思路）**
 
 1. **基线版（Warp 级 Online Softmax）**：一个 Warp（线程束，32 个并行线程）负责一行 `Q_i`，只遍历 `[max(0, i - W), min(M - 1, i + W)]`，用 Online Softmax（在线归一化，一边扫邻居一边维护当前最大值 `m` 和分母 `l`，省去把整行分数存回显存的中间矩阵），再配合 Warp Shuffle（线程束内寄存器洗牌规约）求点积。
-2. **优化版（分块共享内存复用 + 窗口早停 + `exp2f`）**：相邻的 `Br = 32` 行查询窗口高度重叠——以官方基准形状 `M = 5000, d = 64, window_size = 16` 为例，32 行查询的窗口并集总共只需要 `32 + 32 = 64` 行 `K`/`V`。优化版用 `float4`（128 位向量化访存）把 `Bc = 32` 行的 `K`/`V` 搬进 Shared Memory（共享内存，块内高速片上缓存），块级循环只遍历与当前块窗口相交的 `K`/`V` 分块；块内每半个 Warp（16 个线程）同时持有 4 行 `Q`，一次读取共享内存里的 `K`/`V` 向量就能给 4 行共用，并跳过落在这 4 行窗口并集之外的 `j`；同时把缩放因子 `1/sqrt(d)` 乘上 `log2(e)` 预先融进 `Q` 寄存器，让 Online Softmax 直接走单指令硬件 `exp2f`。
+2. **优化版（单次加载共享窗口 + 寄存器双遍 Softmax + `exp2f`）**：相邻的 `Br = 32` 行查询窗口高度重叠——以官方基准形状 `M = 5000, d = 64, window_size = 16` 为例，整个块 32 行查询的窗口并集总共只需要 `32 + 2 × 16 = 64` 行 `K`/`V`（共 `32 KB`）。优化版用 `float4`（128 位向量化访存）一次性把整块需要的 `K`/`V` 搬进 Shared Memory（共享内存，块内高速片上缓存），整个 kernel 只需一次 `__syncthreads()`、无外层分块循环；块内每 8 个线程负责 1 行 `Q`，第一遍在寄存器内算完 33 个窗口分数（3 次 Warp Shuffle）并求最大值，第二遍直接用预缩放 `Q` 配合单指令硬件 `exp2f` 累加 `P @ V`，省去 Online Softmax 每步重缩放输出累加器的开销。对于更大的 `d` 或 `window_size`，自动回退到分块共享内存路径或通用 Warp 路径。
 
 **实测结果（`M = 5000, d = 64, window_size = 16`，FP64 参考对拍）**
 
 | 版本 | 最大误差 (`max_diff`) | 平均耗时 | 加速比 |
 | --- | --- | --- | --- |
 | Baseline（Warp Online Softmax） | `1.788e-07` | `0.0943 ms` | `1.00×` |
-| Optimized（分块共享内存 + 4× 行复用 + `exp2f`） | `1.490e-07` | `0.0743 ms` | `1.27×` |
+| Optimized（单次加载共享窗口 + 寄存器双遍 Softmax） | `1.490e-07` | `0.0452 ms` | `2.09×` |
 
 完整代码：
 - 基线版：[`solutions/transformer/sliding_window_self_attention_baseline.cu`](./solutions/transformer/sliding_window_self_attention_baseline.cu)
