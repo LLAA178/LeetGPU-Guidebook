@@ -47,6 +47,7 @@ chunk_output_kernel<<<num_chunks, 256>>>(Q, K, V, d_state, output, seq_len, gamm
 - **算法复杂度降维（$O(S^2 D) \to O(S D^2)$）**：在基准形状 `seq_len = 4096, d_model = 64` 下，直接计算需要约 2.15 GFLOPs，分块并行保留机制只需约 0.10 GFLOPs，计算量与历史 KV 重复读取同时减少一个数量级以上。
 - **片上共享内存复用 + 零寄存器溢出**：三阶段内核均使用 `4 × 4` 寄存器分块、`float4` 向量化读写与静态缓存的状态缓冲区，编译结果显示主路径三个内核的栈帧与寄存器溢出（spill）均为 0 字节。
 - **本地实测（T4 GPU0）**：在官方基准形状 `seq_len = 4096, d_model = 64, gamma = 0.9` 上，baseline 耗时 `9.9278 ms`（相对 FP64 参考最大绝对误差 `9.537e-06`），优化版降至 `0.0634 ms`（提速 `156.6x`，最大绝对误差 `3.815e-06`），14 组功能与边界用例全部通过。
+- **LeetGPU 平台实测（T4）**：优化版实测 `0.27 ms`（第 96.5 百分位），全部用例通过。
 
 完整代码：
 - baseline：[`solutions/transformer/decaying_causal_attention_baseline.cu`](../../solutions/transformer/decaying_causal_attention_baseline.cu)
