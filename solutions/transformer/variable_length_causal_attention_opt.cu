@@ -50,7 +50,7 @@ __device__ __forceinline__ int find_seq_start(const int* __restrict__ cu_seqlens
 }
 
 // Tiled float4-vectorized FlashAttention for packed variable-length sequences (Br=32, Bc=32):
-// - 2D grid (max_q_blocks, S): each block owns one Q tile within a single sequence s.
+// - Compact 1D grid (ceil(T / Br) + S): eliminates empty 2D-grid blocks with zero host sync.
 // - Reverse per-sequence tile scheduling: heaviest causal tiles launch first.
 // - 4x Q-row register reuse + float4 loads/stores on Q, K, V, sP, output.
 // - Causal early-exit + branch-free interior tiles.
@@ -62,18 +62,42 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
                                     const int* __restrict__ cu_seqlens,
                                     float* __restrict__ output,
                                     int d,
+                                    int S,
                                     float scale) {
-    const int s = blockIdx.y;
-    const int seq_start = cu_seqlens[s];
-    const int seq_end = cu_seqlens[s + 1];
-    const int seq_len = seq_end - seq_start;
-    if (seq_len <= 0) return;
+    __shared__ int s_meta[3];  // [seq_start, seq_len, q_block_idx]
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        const int bid = blockIdx.x;
+        int acc = 0;
+        int found_start = -1;
+        int found_len = 0;
+        int found_qblk = 0;
+        int prev = cu_seqlens[0];
+        for (int s = 0; s < S; ++s) {
+            const int next = cu_seqlens[s + 1];
+            const int len = next - prev;
+            const int nb = (len + kBr - 1) / kBr;
+            if (bid < acc + nb) {
+                found_start = prev;
+                found_len = len;
+                // Reverse tile scheduling within each sequence: heaviest causal tiles run first.
+                found_qblk = nb - 1 - (bid - acc);
+                break;
+            }
+            acc += nb;
+            prev = next;
+        }
+        s_meta[0] = found_start;
+        s_meta[1] = found_len;
+        s_meta[2] = found_qblk;
+    }
+    __syncthreads();
 
-    const int num_q_blocks = (seq_len + kBr - 1) / kBr;
-    if (blockIdx.x >= num_q_blocks) return;
+    const int seq_start = s_meta[0];
+    if (seq_start < 0) return;
 
-    // Reverse tile scheduling within each sequence: heaviest causal tiles run first.
-    const int q_block_idx = num_q_blocks - 1 - blockIdx.x;
+    const int seq_len = s_meta[1];
+    const int q_block_idx = s_meta[2];
     const int q_block_row = q_block_idx * kBr;
     const int q_len = min(kBr, seq_len - q_block_row);
     const int q_max_row = q_block_row + q_len - 1;
@@ -84,7 +108,6 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
     float* sKV = sQ + kBr * d_stride;
     float* sP = sKV + kBc * d_stride;  // 32 * 36
 
-    const int tid = threadIdx.x;
     const int ty = tid >> 4;  // 0..7  -> 4 Q rows (ty*4 .. ty*4+3)
     const int tx = tid & 15;  // 0..15 -> 2 K cols / float4 O chunks
     const int vec_d = d >> 2;
@@ -400,14 +423,13 @@ extern "C" void solve(const float* Q,
         const size_t smem_bytes =
             (static_cast<size_t>(kBr + kBc) * d_stride + static_cast<size_t>(kBr) * 36) *
             sizeof(float);
-        const int max_q_blocks = (T + kBr - 1) / kBr;
-        dim3 grid(max_q_blocks, S);
+        const int total_blocks = (T + kBr - 1) / kBr + S;
         if (d <= 64) {
-            varlen_causal_attention_br32_kernel<1><<<grid, kThreads, smem_bytes>>>(
-                Q, K, V, cu_seqlens, output, d, scale);
+            varlen_causal_attention_br32_kernel<1><<<total_blocks, kThreads, smem_bytes>>>(
+                Q, K, V, cu_seqlens, output, d, S, scale);
         } else {
-            varlen_causal_attention_br32_kernel<2><<<grid, kThreads, smem_bytes>>>(
-                Q, K, V, cu_seqlens, output, d, scale);
+            varlen_causal_attention_br32_kernel<2><<<total_blocks, kThreads, smem_bytes>>>(
+                Q, K, V, cu_seqlens, output, d, S, scale);
         }
     } else {
         const int blocks = (T + 3) / 4;
