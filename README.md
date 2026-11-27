@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [sparse-matrix-vector-multiplication](#sparse-matrix-vector-multiplication) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,41 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [sparse-matrix-vector-multiplication](https://leetgpu.com/challenges/sparse-matrix-vector-multiplication)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
+*环境: CUDA*
 
-给定按行主序存放的稀疏矩阵 $A$（尺寸 $M \times N$，约 60%–70% 元素为 0）和长度为 $N$ 的稠密向量 $x$，这道题要计算矩阵向量乘 $y = A x$，也就是把 $A$ 的每一行与 $x$ 做内积，得到长度为 $M$ 的输出向量 $y$。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-以官方示例（$3 \times 4$ 矩阵）为例：
-- 第 0 行 `[5, 0, 0, 1]` 与 `x = [1, 2, 3, 4]` 做内积，得到 `5*1 + 1*4 = 9`；
-- 第 1 行 `[0, 2, 3, 0]` 得到 `2*2 + 3*3 = 13`；
-- 第 2 行 `[0, 0, 0, 4]` 得到 `4*4 = 16`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-虽然矩阵 $A$ 里大约有 65% 是 0，但输入仍然以完整的行主序稠密数组形式存在显存里，读完整个 $A$ 的显存带宽（HBM，高带宽显存）才是真正的瓶颈。在官方性能测试尺寸 `M = 1,000, N = 10,000` 下，$A$ 占 40 MB，$x$ 仅占 40 KB，整条算子属于典型的访存受限（memory-bound）问题。
+> baseline：按级启动的多遍全局蝶形变换
 
-> 基础实现（1 线程处理 1 行）
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
-最直接的写法是让每个线程负责计算输出向量 $y$ 的一个元素：循环遍历该行的 $N$ 列，遇到非零元素就累乘到 `sum` 里。这个写法在 `M = 1,000, N = 10,000` 时有两个明显短板：
-1. 总共只启动了 1,000 个线程，大部分计算单元处于空闲状态；
-2. 相邻线程在同一时刻访问的是相邻行的同一列，内存地址跨度高达 `N * 4 = 40 KB`，无法触发合并访存（coalesced access，指相邻线程读取连续内存地址以合并为更少的显存事务），带宽利用率很低。
+```cuda
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
 
-> 优化实现（`float4` 向量化读取 + 1 个 warp 同时处理 2 行）
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
+}
+```
 
-优化版本围绕“把显存带宽吃满”和“复用向量 $x$”做了三处改动：
-1. **按线程束协作读行**：当 `N` 为 4 的倍数且 `A`、`x` 满足 16 字节对齐时，让一个 warp（线程束，32 个同步执行的线程）沿列方向协作读取同一行，相邻线程访问连续地址，天然满足合并访存；最后用 `__shfl_down_sync`（线程束内寄存器洗牌归约）把 32 个局部和归约到 0 号线程，省去共享内存同步开销。
-2. **`float4` 向量化读取与无分支乘加**：每个线程每次用 `__ldg`（通过只读缓存加载）一次读入 4 个 `float`（128 位），直接用 `fmaf`（融合乘加指令）累加，去掉 `a != 0.0f` 的条件判断，避免线程束分支分歧（warp divergence）。
-3. **单 warp 同时算 2 行以复用 `x`**：同一个 warp 把 `x` 的一个 `float4` 读进寄存器（register，片上最快存储）后，同时与连续两行 $A[\text{row}_0], A[\text{row}_1]$ 做乘加，把对 `x` 的读取次数减半，同时提升指令级并行度以隐藏访存延迟。对于未对齐或 `N % 4 != 0` 的边界情况，自动回退到标量 warp 归约路径保证通用正确性。
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-> 实测成绩（`M = 1,000, N = 10,000`，65% 稀疏，有效访存约 40.044 MB）
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-- **LeetGPU 官方 T4**：优化版一次性通过全部测试，耗时 **0.19 ms**（第 **96.4** 百分位）
-- **本地 T4 对照实测**：
-  - 基础实现（`spmv_baseline.cu`）：`1.5461 ms`（约 `25.90 GB/s`）
-  - 优化实现（`spmv_opt.cu`）：`0.1315 ms`（约 `304.47 GB/s`，0 字节寄存器溢出）
-  - 加速比：**11.76x**，在所有官方示例、边界用例与基准尺寸上与 FP64 CPU 参考结果对拍通过（`max_abs = 7.053e-04`，`max_rel = 1.713e-04`）。
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
 
-完整代码：
-- 基础版：[`solutions/matmul/spmv_baseline.cu`](./solutions/matmul/spmv_baseline.cu)
-- 优化版：[`solutions/matmul/spmv_opt.cu`](./solutions/matmul/spmv_opt.cu)
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
+
+```cuda
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
+```
+
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
+
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
