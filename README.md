@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) |  |  |
+| [count-array-element](#count-array-element) | [top-p-sampling](#top-p-sampling) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2025,6 +2025,55 @@ C[c_idx] = __float2half(out);
 优化版在 LeetGPU 官方 T4 上通过全部测试，耗时 **0.29 ms**（第 **95.6** 百分位）；本地 T4 对照测试中，基线版 `1024×1024×1024` 耗时 `3.74 ms`，优化版降至 `0.105 ms`（快了 35 倍）。
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
+
+### [top-p-sampling](https://leetgpu.com/challenges/top-p-sampling)
+*环境: CUDA*
+
+对长度为 `vocab_size` 的词表分数 `logits`，先算 Softmax 概率并按“概率从大到小、概率相同时词表下标从小到大”排序，截取累计概率首次达到阈值 `p[0]` 的最小前缀集合（核集合 Nucleus），重归一化后用 `seed[0]` 驱动的 PCG 哈希与指数竞赛公式选出获胜词元写入 `sampled_token[0]`。
+
+用官方 4 词元例子 `logits = [1.0, 2.0, 3.0, 0.5]`、`p = 0.9`、`seed = 42` 走一遍完整流程：
+1. **转成概率并稳定降序排列**：Softmax 概率依次约为 `[0.0853, 0.2320, 0.6310, 0.0518]`；按概率降序排好后，词元下标顺序为 `[2, 1, 0, 3]`，对应概率 `[0.6310, 0.2320, 0.0853, 0.0518]`。
+2. **截取核集合并重归一化**：从前往后累加概率，前两个词元和为 `0.8630 < 0.9`，加上第 3 个词元（下标 `0`）后达到 `0.9483 >= 0.9`，于是核集合锁定为 `[2, 1, 0]`，各自除以三者总和 `0.9483` 得到重归一化概率 `q ≈ [0.6654, 0.2446, 0.0900]`。
+3. **PCG 哈希指数竞赛采样**：对核内每个词元下标 `i` 计算 `u_i = (pcg(pcg(seed) + i) + 0.5) / 2^32`，比较竞赛得分 `q_i / (-ln u_i)`：词元 `2`、`1`、`0` 的得分依次约为 `0.1249`、`0.1791`、`0.2079`，词元 `0` 得分最高胜出，输出 `sampled_token[0] = 0`。
+
+> baseline
+
+为了把“概率降序、平局按下标升序”的稳定排序压成单次无分支整数比较，先把单精度概率映射成保序无符号整数，高 32 位存概率、低 32 位存按位取反的下标 `~idx` 拼成 `uint64_t` 键值。基线版算出全词表概率后，在全局显存上对整张词表做完整的双调排序（Bitonic Sort，规模补齐到 `2` 的幂），再扫描前缀和找出截断点并完成指数竞赛：
+
+```cuda
+// 高 32 位存保序浮点概率，低 32 位存 ~idx：单次无符号降序比较即等价于 (prob DESC, idx ASC)
+__device__ uint64_t pack_desc_prob_asc_idx(float prob, int idx) {
+    uint32_t u = __float_as_uint(prob);
+    uint32_t ord = (u & 0x80000000u) ? (~u) : (u ^ 0x80000000u);
+    return (static_cast<uint64_t>(ord) << 32) | static_cast<uint64_t>(~static_cast<uint32_t>(idx));
+}
+```
+
+> optimized：分箱概率质量过滤 + 片上共享内存核排序
+
+看官方计时规模 `vocab_size = 50,000`（标准差为 `3.0` 的正态分布，`p = 0.9`）：若像基线版那样补齐到 `65,536` 做全局双调排序，一共要启动 `16 × 17 / 2 = 136` 次排序核函数；但实际上 `90%` 的概率质量集中在头部约 `600` 个高分词元里，剩下 `98%` 以上的长尾词元根本进不了核集合。
+
+优化版直接在二级缓存（L2 cache，`50,000` 个浮点数仅占 `200 KB`）和片上共享内存（shared memory）里把无效排序砍掉，且全程留在 GPU 端执行（读取设备指针 `p[0]` 与 `seed[0]` 零主机同步）：
+- **第一趟（`float4` 在线归约 `max_logit` 与指数和）**：用 128 位向量加载单遍算出全局最大分数和归一化分母，最后一个退役块写回全局标量。
+- **第二趟（512 桶对数间距直方图定位截断桶）**：按与最大分数的差距 `delta = max_logit - logits[i]` 以 `1/32` 为步长划出 `512` 个分桶，在共享内存统计每个桶的概率质量与词元个数。扫一遍这 `512` 个桶就能立刻锁定累计概率首次跨过 `p[0]` 的截断桶 `cut_bin`，把排在后面的数万个低概率长尾词元一次性筛除。
+- **第三趟（候选提取与片上精确排序采样）**：只把落在 `0 .. cut_bin` 内的候选词元（典型规模仅数百个）提取出来打包成 `uint64_t` 键值，放进单块 `32 KiB` 片上共享内存完成排序、单精度累计和截断与双精度 PCG 指数竞赛。遇到极端全相等词表导致候选数超过 `4,096` 时，单线程块直接在二级缓存常驻缓冲区内完成全线程对齐的双调排序兜底，保证包括平局保序在内的所有边界与参考实现逐位一致：
+
+```cuda
+// 只提取落在截断桶 cut_bin 以内的头部高概率候选词元（典型仅数百个，直接省去 98%+ 长尾排序）
+const float x = __ldg(&logits[i]);
+if (logit_to_bin(x, max_l) <= cut_bin) {
+    const float prob = expf(x - max_l) * inv_z;
+    const unsigned int pos = atomicAdd(&g_cand_write_pos, 1u);
+    g_cand_keys[pos] = pack_prob_idx(prob, i);
+}
+// 随后单线程块在片上共享内存完成候选排序、精确 float32 累计和截断与双精度 PCG 指数竞赛
+```
+
+词表规模 `vocab_size <= 4,096` 时，入口直接走单块全片上核函数 **1 次启动**完成全部步骤；大词表走上述异步分箱过滤管线，零 `cudaMalloc`、零主机同步。
+
+优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **0.52 ms**（第 **95.7** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方计时规模 `vocab_size = 50,000`（`p = 0.9`）下取 15 轮中位数，全词表双调排序基线耗时 `0.3818 ms`，分箱过滤片上排序版降至 **`0.1638 ms`**（提速 **`2.33x`**）。
+
+完整代码：[全词表排序基线](./solutions/reduction/top-p-sampling-baseline.cu) · [分箱过滤片上核排序优化](./solutions/reduction/top-p-sampling-opt.cu)
 
 ## 困难题
 
