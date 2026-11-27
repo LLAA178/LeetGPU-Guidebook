@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) |  |  |
+| [count-array-element](#count-array-element) | [sparse-matrix-vector-multiplication](#sparse-matrix-vector-multiplication) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2025,6 +2025,42 @@ C[c_idx] = __float2half(out);
 优化版在 LeetGPU 官方 T4 上通过全部测试，耗时 **0.29 ms**（第 **95.6** 百分位）；本地 T4 对照测试中，基线版 `1024×1024×1024` 耗时 `3.74 ms`，优化版降至 `0.105 ms`（快了 35 倍）。
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
+
+### [sparse-matrix-vector-multiplication](https://leetgpu.com/challenges/sparse-matrix-vector-multiplication)
+
+给定按行主序存放的稀疏矩阵 $A$（尺寸 $M \times N$，约 60%–70% 元素为 0）和长度为 $N$ 的稠密向量 $x$，这道题要计算矩阵向量乘 $y = A x$，也就是把 $A$ 的每一行与 $x$ 做内积，得到长度为 $M$ 的输出向量 $y$。
+
+以官方示例（$3 \times 4$ 矩阵）为例：
+- 第 0 行 `[5, 0, 0, 1]` 与 `x = [1, 2, 3, 4]` 做内积，得到 `5*1 + 1*4 = 9`；
+- 第 1 行 `[0, 2, 3, 0]` 得到 `2*2 + 3*3 = 13`；
+- 第 2 行 `[0, 0, 0, 4]` 得到 `4*4 = 16`。
+
+虽然矩阵 $A$ 里大约有 65% 是 0，但输入仍然以完整的行主序稠密数组形式存在显存里，读完整个 $A$ 的显存带宽（HBM，高带宽显存）才是真正的瓶颈。在官方性能测试尺寸 `M = 1,000, N = 10,000` 下，$A$ 占 40 MB，$x$ 仅占 40 KB，整条算子属于典型的访存受限（memory-bound）问题。
+
+> 基础实现（1 线程处理 1 行）
+
+最直接的写法是让每个线程负责计算输出向量 $y$ 的一个元素：循环遍历该行的 $N$ 列，遇到非零元素就累乘到 `sum` 里。这个写法在 `M = 1,000, N = 10,000` 时有两个明显短板：
+1. 总共只启动了 1,000 个线程，大部分计算单元处于空闲状态；
+2. 相邻线程在同一时刻访问的是相邻行的同一列，内存地址跨度高达 `N * 4 = 40 KB`，无法触发合并访存（coalesced access，指相邻线程读取连续内存地址以合并为更少的显存事务），带宽利用率很低。
+
+> 优化实现（`float4` 向量化读取 + 1 个 warp 同时处理 2 行）
+
+优化版本围绕“把显存带宽吃满”和“复用向量 $x$”做了三处改动：
+1. **按线程束协作读行**：当 `N` 为 4 的倍数且 `A`、`x` 满足 16 字节对齐时，让一个 warp（线程束，32 个同步执行的线程）沿列方向协作读取同一行，相邻线程访问连续地址，天然满足合并访存；最后用 `__shfl_down_sync`（线程束内寄存器洗牌归约）把 32 个局部和归约到 0 号线程，省去共享内存同步开销。
+2. **`float4` 向量化读取与无分支乘加**：每个线程每次用 `__ldg`（通过只读缓存加载）一次读入 4 个 `float`（128 位），直接用 `fmaf`（融合乘加指令）累加，去掉 `a != 0.0f` 的条件判断，避免线程束分支分歧（warp divergence）。
+3. **单 warp 同时算 2 行以复用 `x`**：同一个 warp 把 `x` 的一个 `float4` 读进寄存器（register，片上最快存储）后，同时与连续两行 $A[\text{row}_0], A[\text{row}_1]$ 做乘加，把对 `x` 的读取次数减半，同时提升指令级并行度以隐藏访存延迟。对于未对齐或 `N % 4 != 0` 的边界情况，自动回退到标量 warp 归约路径保证通用正确性。
+
+> 实测成绩（`M = 1,000, N = 10,000`，65% 稀疏，有效访存约 40.044 MB）
+
+- **LeetGPU 官方 T4**：优化版一次性通过全部测试，耗时 **0.19 ms**（第 **96.4** 百分位）
+- **本地 T4 对照实测**：
+  - 基础实现（`spmv_baseline.cu`）：`1.5461 ms`（约 `25.90 GB/s`）
+  - 优化实现（`spmv_opt.cu`）：`0.1315 ms`（约 `304.47 GB/s`，0 字节寄存器溢出）
+  - 加速比：**11.76x**，在所有官方示例、边界用例与基准尺寸上与 FP64 CPU 参考结果对拍通过（`max_abs = 7.053e-04`，`max_rel = 1.713e-04`）。
+
+完整代码：
+- 基础版：[`solutions/matmul/spmv_baseline.cu`](./solutions/matmul/spmv_baseline.cu)
+- 优化版：[`solutions/matmul/spmv_opt.cu`](./solutions/matmul/spmv_opt.cu)
 
 ## 困难题
 
