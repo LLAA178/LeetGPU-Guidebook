@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [histogramming](#histogramming) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,56 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [histogramming](https://leetgpu.com/challenges/histogramming)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-统计长度为 `N` 的整数数组 `input` 中每个落在 `[0, num_bins)` 范围内的整数出现次数，把结果写入长度为 `num_bins` 的数组 `histogram`（越界整数安全忽略，且 `histogram` 传入时可能含有未清零的旧值）。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-举个例子：`input = [0, 1, 2, 1, 0]`，`num_bins = 3`。如果所有线程直接往全局显存里的 `histogram[0..2]` 做原子加法（`atomicAdd`，保证多线程同时加同一个桶时不丢数的硬件读改写指令），成千上万个线程会在同一个显存地址前排队。更省时间的做法是拆成两级：
-1. **块内私有分桶**：每个线程块先在片上共享内存（shared memory，速度接近寄存器的块内高速缓存）里建一份局部桶，把 `[0, 1, 2]` 和 `[1, 0]` 分别累加出局部计数 `[1, 1, 1]` 与 `[1, 1, 0]`。
-2. **块间一次汇总**：所有输入扫完后，每个块只把非零局部桶往全局 `histogram` 累加一次，合并得到最终结果 `[2, 2, 1]`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline：块内单份共享内存直方图
+> baseline：按级启动的多遍全局蝶形变换
 
-基线版先用 `cudaMemsetAsync` 把全局 `histogram` 清零，再让每个线程块在共享内存开单份 `s_hist[1024]`。块内线程通过网格跨步循环（grid-stride loop，固定总线程数，每个线程每次跨过整个网格宽度 `gridDim.x * blockDim.x` 继续处理后续元素）遍历输入并在 `s_hist` 上做 `atomicAdd`，最后把块内结果写回全局显存：
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-for (int i = global_tid; i < n; i += stride) {
-    const unsigned v = static_cast<unsigned>(input[i]);  // 单次无符号比较同时过滤负数与 >= num_bins
-    if (v < static_cast<unsigned>(num_bins)) {
-        atomicAdd(&s_hist[v], 1);
-    }
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
 }
 ```
 
-这版把全局显存原子排队转移到了片上共享内存，但还有三处开销：每次只读 4 字节标量浪费了显存带宽；块内 8 个线程束（warp，GPU 上 32 个锁步执行的线程组）挤在同一份 `s_hist` 上仍会产生共享内存存储体冲突（bank conflict，多个线程同时读写同一个共享内存通道导致硬件串行排队）；当输入全是同一个数（如全 `2`）时，同一线程束的 32 个线程还会发生 32 路原子串行。
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-> optimized：多副本私有分桶 + 固定常驻网格 + `int4` 向量化与同值快路径
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-为了逼近纯读取显存带宽下限并消除偏斜数据的冲突退化，优化版把访存、分桶和汇总压到最简：
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
 
-- **按线程束拆分私有直方图**：当 `num_bins <= 256`（官方计时规模）时，块内 8 个线程束各自独占一行 `s_hist[8][256 + 1]`（末尾 `+ 1` 错开存储体映射），不同线程束之间零原子竞争；当 `256 < num_bins <= 1024` 时切到 4 份 `s_hist[4][1025]`（共 16.4 KB），兼顾低冲突与流多处理器（SM）驻留块数。
-- **线程束同值快路径**：每个线程用 `int4` 一次从全局显存读入 4 个整数（16 字节合并访存，循环 4 路展开提升访存并发度）。写入共享内存前，用一条寄存器洗牌指令 `__shfl_sync` 和一条全束投票指令 `__all_sync` 检查整个线程束读到的 128 个整数是否全相等：均匀分布时两拍指令直接跳过；一旦遇到全相同输入，仅由 `lane 0` 对私有桶加一次 `128`，彻底绕开 32 路原子串行。
-- **固定常驻网格跨步**：网格大小上限固定为 `160` 个常驻块（对应 40 个 SM 各驻留 4 个块，打满每 SM 32 个常驻线程束上限），扫完整个 `200 MB` 输入后全局最多只发生 `160` 次块间汇总，省掉成千上万个短命块的共享内存清零与同步开销；当 `N <= 2048` 时直接启动单块覆盖写出 `histogram`，连 `cudaMemsetAsync` 一并省去。
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
 
 ```cuda
-const int same4 = (v.x == v.y) & (v.z == v.w) & (v.x == v.z);
-const int ref = __shfl_sync(0xffffffffu, v.x, 0);
-if (__all_sync(0xffffffffu, same4 & (v.x == ref))) {
-    if (lane == 0 && static_cast<unsigned>(ref) < u_bins) s_hist[warp][ref] += 128;
-} else {
-    if (static_cast<unsigned>(v.x) < u_bins) atomicAdd(&s_hist[warp][v.x], 1);
-    if (static_cast<unsigned>(v.y) < u_bins) atomicAdd(&s_hist[warp][v.y], 1);
-    if (static_cast<unsigned>(v.z) < u_bins) atomicAdd(&s_hist[warp][v.z], 1);
-    if (static_cast<unsigned>(v.w) < u_bins) atomicAdd(&s_hist[warp][v.w], 1);
-}
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
 ```
 
-0.81 ms 96.8th percentile (T4)
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
 
-省掉标量读取开销、块内跨线程束原子冲突和海量短块同步后，在本地 Tesla T4（CUDA 12.4）上实测官方计时规模 `N = 50,000,000, num_bins = 256`（每次刷空 L2，15 轮中位数）：均匀分布下耗时由基线的 `0.698 ms` 降至 **`0.657 ms`**（有效读取带宽达 `304.4 GB/s`），全相同元素极端场景下更从 `1.647 ms` 降至 **`0.655 ms`**（提速 **2.51 倍**）。LeetGPU 官方 Tesla T4 首次提交即通过全部测试，耗时 **`0.81 ms`（第 `96.8` 百分位）**。
-
-完整代码：[共享内存单桶基线](./solutions/reduction/histogramming-baseline.cu) · [多副本向量化常驻网格](./solutions/reduction/histogramming-opt.cu)
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
