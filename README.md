@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) |  |  |
-| [count-array-element](#count-array-element) |  |  |
+| [count-array-element](#count-array-element) | [attention-with-linear-biases](#attention-with-linear-biases) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -1993,6 +1993,48 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 这题和普通逐元素 kernel 的差别在于：优化目标不是少做乘法，而是把“同一个 tile 共用同一个 scale”这件事吃干净。
 
 完整代码：[`solutions/quantization/weight-dequantization.cu`](./solutions/quantization/weight-dequantization.cu)
+
+### [attention-with-linear-biases](https://leetgpu.com/challenges/attention-with-linear-biases)
+*环境: CUDA*
+
+一句话：本题计算带线性位置偏置（ALiBi）的注意力，对查询矩阵 `Q`（`M×d`）、键矩阵 `K`（`N×d`）和值矩阵 `V`（`N×d`）求 `softmax(Q @ K^T / sqrt(d) + alpha * (i - j)) @ V`，其中 `i`、`j` 分别是查询行号和键行号。
+
+举个小例子：当 `M=1, N=2, d=2, alpha=0.8`，`Q=[[1, 2]]`，`K=[[1, 0], [0, 1]]`，`V=[[3, 4], [5, 6]]` 时，第 0 个查询和第 0、1 个键的点积除以 `sqrt(2)` 分别是 `0.707` 和 `1.414`，加上线性偏置 `0.8*(0-0)=0` 和 `0.8*(0-1)=-0.8` 后得到 `0.707` 和 `0.614`，做完行内 softmax 得到权重 `[0.523, 0.477]`，再对 `V` 加权求和就是 `[3.95, 4.95]`。
+
+> baseline
+每个 warp（32 个并行执行的线程）负责一行 `Q`，依次扫描每一行 `K` 和 `V`，并用 Online Softmax（在线归约最大值和指数和，省去把整张 `M×N` 分数矩阵写回显存）直接累加输出：
+
+```CUDA
+float score = __shfl_sync(0xffffffff, warp_reduce_sum(dot), 0);
+score += alibi_alpha * static_cast<float>(q_row - k_row);
+
+float m_new = fmaxf(m, score);
+float rescale = __expf(m - m_new);
+float p = __expf(score - m_new);
+l = l * rescale + p;
+```
+
+> 优化点
+- **shared memory（片上共享内存）分块复用**：baseline 里每行 `Q` 都要把完整的 `K`、`V` 从全局显存重读一遍。优化版按 `Br=8, Bc=32` 分块，一个 128 线程块（`8×16` 布局）把 8 行 `Q` 和 32 行 `K`/`V` 搬进片上共享内存，8 行 `Q` 共享同一批 `K`/`V`，显存读取量直接降为约 1/8。
+- **float4（128 位向量读写）与寄存器累加**：每次用 `float4` 一次搬运 4 个浮点数，16 个线程协同处理一行 `Q` 的 32 列分数和输出累加，零寄存器溢出；`d` 不是 4 的倍数或超过 256 时自动回退到通用 warp 版本。
+- **本地实测（M=2048, N=2048）**：`d=64` 时耗时从 `5.051 ms` 降到 `1.265 ms`（约 4.0× 加速），`d=128` 时从 `6.713 ms` 降到 `2.434 ms`（约 2.8× 加速），与 FP64 CPU 参考结果最大误差低于 `4e-7`。
+
+> optimized
+```CUDA
+if (k0 < kv_len) {
+    s0 = fmaf(alibi_alpha, static_cast<float>(q_global_row - (k_start + k0)), s0);
+}
+if (k1 < kv_len) {
+    s1 = fmaf(alibi_alpha, static_cast<float>(q_global_row - (k_start + k1)), s1);
+}
+float tile_max = subwarp16_max(rmax);
+float m_new = fmaxf(m, tile_max);
+float rescale = __expf(m - m_new);
+```
+
+完整代码：
+- Baseline：[`solutions/transformer/attention_with_linear_biases_baseline.cu`](./solutions/transformer/attention_with_linear_biases_baseline.cu)
+- Optimized：[`solutions/transformer/attention_with_linear_biases_opt.cu`](./solutions/transformer/attention_with_linear_biases_opt.cu)
 
 ## 困难题
 
