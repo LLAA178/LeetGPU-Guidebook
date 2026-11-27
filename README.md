@@ -22,7 +22,7 @@
 | [relu](#relu) | [rotary-positional-embedding](#rotary-positional-embedding) |  |
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
-| [matrix-copy](#matrix-copy) |  |  |
+| [matrix-copy](#matrix-copy) | [softmax-attention](#softmax-attention) |  |
 | [count-array-element](#count-array-element) |  |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
@@ -1993,6 +1993,38 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 这题和普通逐元素 kernel 的差别在于：优化目标不是少做乘法，而是把“同一个 tile 共用同一个 scale”这件事吃干净。
 
 完整代码：[`solutions/quantization/weight-dequantization.cu`](./solutions/quantization/weight-dequantization.cu)
+
+### [softmax-attention](https://leetgpu.com/challenges/softmax-attention)
+*环境: CUDA*
+
+这题要算缩放点积注意力：给查询矩阵 `Q[M, d]`、键矩阵 `K[N, d]` 和值矩阵 `V[N, d]`（单精度浮点 FP32），按 `softmax(Q × K^T / sqrt(d)) × V` 算出输出矩阵 `output[M, d]`。
+
+举个小例子：假设 `M = 512, N = 256, d = 64`。如果先把 `512 × 256` 的注意力分数表写回全局显存再做 softmax，会多出整整一轮显存读写；直接用 Online Softmax（在线归一化）一边扫 `K/V` 一边更新最大值和指数和，就能把中间分数表省掉。
+
+> baseline
+
+每个线程束（warp，32 个线程）负责 1 行 `Q`，把这一行 `Q` 和输出累加器留在寄存器里。遍历每一行 `K/V` 时，线程束内用洗牌归约算出点积分数，在线更新当前最大值 `m`、指数和 `l` 和加权输出，最后统一除以 `l`。
+
+```CUDA
+float m_new = fmaxf(m, score);
+float alpha = expf(m - m_new);
+float p = expf(score - m_new);
+l = l * alpha + p;
+for (int i = 0; i < elems; ++i) {
+    o_reg[i] = fmaf(p, v_ptr[col], o_reg[i] * alpha);
+}
+m = m_new;
+```
+
+> optimized
+
+基线版里一个线程束只算 1 行 `Q`，每扫一行 `K/V` 只用一次就丢掉。优化版做了两处关键改动：
+- **单线程束复用 4 行 `Q`**：让每个线程束同时把 4 行 `Q` 和 4 行输出累加器常驻寄存器（`d <= 128` 时按维度编译期展开为 1–4 个元素/线程，零寄存器溢出）。每读入 1 行 `K` 和 1 行 `V` 就同时给 4 行 `Q` 算点积和加权和，`K/V` 的读取次数直接降到原来的 1/4。
+- **零共享内存 + 硬件快速指数**：不占用共享内存，让每个流多处理器（SM）可以同时驻留更多线程块，把 `K/V` 留在片上 L1/L2 缓存里反复命中；同时用 `__expf`（硬件快速指数指令）替代软件 `expf` 降低每步延迟。
+
+本地 T4 实测中，`M = 512, N = 256, d = 64` 中位耗时由基线 `0.246 ms` 降至 `0.106 ms`（快了 2.3 倍），`d = 128` 由 `0.202 ms` 降至 `0.133 ms`；LeetGPU 平台官方成绩待在线提交核验后补录。
+
+完整代码：[Online Softmax 基线版](solutions/transformer/softmax_attention_baseline.cu) · [4-Row 寄存器复用优化版](solutions/transformer/softmax_attention_flash.cu)
 
 ## 困难题
 
