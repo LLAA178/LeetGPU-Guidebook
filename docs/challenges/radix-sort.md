@@ -49,6 +49,6 @@ wb = __shfl_sync(0xffffffffu, wb, leader);
 ranks[r] = static_cast<uint16_t>(wb + peer_rank);
 ```
 
-在 `N = 50,000,000` 基准评测中（每次计时前刷空二级缓存，取 15 轮中位数），四趟扫描散射基线耗时 `33.33 ms`，Onesweep 解耦回看优化版降至 **`12.92 ms`**（提速 **`2.58x`**，吞吐达 **`3,868.9 Mkeys/s`**）。
+在 `N = 50,000,000` 基准评测中（每次计时前刷空二级缓存，取 15 轮中位数），四趟扫描散射基线耗时 `33.33 ms`，Onesweep 解耦回看优化版降至 **`12.83 ms`**（提速 **`2.60x`**，吞吐达 **`3,896.8 Mkeys/s`**）；在 LeetGPU 官方 T4 评测中一次通过全部测试，耗时 **12.39 ms**（第 **99.6** 百分位）。
 
 完整代码：[四趟扫描散射基线](../../solutions/reduction/radix-sort-baseline.cu) · [Onesweep 解耦回看优化版](../../solutions/reduction/radix-sort-opt.cu)
