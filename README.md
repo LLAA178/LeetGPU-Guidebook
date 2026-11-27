@@ -15,7 +15,7 @@
 | --- | --- | --- |
 | [vector-addition](#vector-addition) | [reduction](#reduction) | [multi-head-attention](#multi-head-attention) |
 | [matrix-multiplication](#matrix-multiplication) | [softmax](#softmax) | [gpt-2-transformer-block](#gpt-2-transformer-block) |
-| [matrix-transpose](#matrix-transpose) | [dot-product](#dot-product) |  |
+| [matrix-transpose](#matrix-transpose) | [dot-product](#dot-product) | [sliding-window-self-attention](#sliding-window-self-attention) |
 | [color-inversion](#color-inversion) | [parallel-merge](#parallel-merge) |  |
 | [1d-convolution](#1d-convolution) | [int8-quantized-matmul](#int8-quantized-matmul) |  |
 | [reverse-array](#reverse-array) | [batch-normalization](#batch-normalization) |  |
@@ -2220,3 +2220,33 @@ __global__ void attn(const float* qkv, float* output, const float* weights, int 
 - attention 的 `(token, head, dim)` 映射怎么落到 kernel
 
 完整代码：[`solutions/transformer/gpt-2-transformer-block.cu`](./solutions/transformer/gpt-2-transformer-block.cu)
+
+---
+
+### [sliding-window-self-attention](https://leetgpu.com/challenges/sliding-window-self-attention)
+
+一句话说明要算什么：给三张大小同为 `M × d` 的矩阵 `Q`、`K`、`V` 和窗口半径 `window_size`，每个位置 `i` 只跟左右距离不超过 `window_size` 的邻居 `j ∈ [max(0, i - window_size), min(M - 1, i + window_size)]` 计算缩放点积注意力并输出加权和。
+
+先看一个小例子：假设 `M = 4`，`window_size = 1`。
+- 位置 `0` 只看位置 `0, 1`；
+- 位置 `1` 只看位置 `0, 1, 2`；
+- 位置 `2` 只看位置 `1, 2, 3`；
+- 位置 `3` 只看位置 `2, 3`。
+
+每一行把窗口内的点积除以 `sqrt(d)` 后做 Softmax（归一化指数权重），再按权重把对应行的 `V` 加起来，就得到这一行的输出。
+
+**省了哪一步（核心优化思路）**
+
+1. **基线版（Warp 级 Online Softmax）**：一个 Warp（线程束，32 个并行线程）负责一行 `Q_i`，只遍历 `[max(0, i - W), min(M - 1, i + W)]`，用 Online Softmax（在线归一化，一边扫邻居一边维护当前最大值 `m` 和分母 `l`，省去把整行分数存回显存的中间矩阵），再配合 Warp Shuffle（线程束内寄存器洗牌规约）求点积。
+2. **优化版（分块共享内存复用 + 窗口早停 + `exp2f`）**：相邻的 `Br = 32` 行查询窗口高度重叠——以官方基准形状 `M = 5000, d = 64, window_size = 16` 为例，32 行查询的窗口并集总共只需要 `32 + 32 = 64` 行 `K`/`V`。优化版用 `float4`（128 位向量化访存）把 `Bc = 32` 行的 `K`/`V` 搬进 Shared Memory（共享内存，块内高速片上缓存），块级循环只遍历与当前块窗口相交的 `K`/`V` 分块；块内每半个 Warp（16 个线程）同时持有 4 行 `Q`，一次读取共享内存里的 `K`/`V` 向量就能给 4 行共用，并跳过落在这 4 行窗口并集之外的 `j`；同时把缩放因子 `1/sqrt(d)` 乘上 `log2(e)` 预先融进 `Q` 寄存器，让 Online Softmax 直接走单指令硬件 `exp2f`。
+
+**实测结果（`M = 5000, d = 64, window_size = 16`，FP64 参考对拍）**
+
+| 版本 | 最大误差 (`max_diff`) | 平均耗时 | 加速比 |
+| --- | --- | --- | --- |
+| Baseline（Warp Online Softmax） | `1.788e-07` | `0.0943 ms` | `1.00×` |
+| Optimized（分块共享内存 + 4× 行复用 + `exp2f`） | `1.490e-07` | `0.0743 ms` | `1.27×` |
+
+完整代码：
+- 基线版：[`solutions/transformer/sliding_window_self_attention_baseline.cu`](./solutions/transformer/sliding_window_self_attention_baseline.cu)
+- 优化版：[`solutions/transformer/sliding_window_self_attention_opt.cu`](./solutions/transformer/sliding_window_self_attention_opt.cu)
