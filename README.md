@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [fused-residual-add-and-rms-norm](#fused-residual-add-and-rms-norm) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,63 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [fused-residual-add-and-rms-norm](https://leetgpu.com/challenges/fused-residual-add-and-rms-norm)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-对形状为 `[N, C]` 的输入矩阵 `x` 与残差矩阵 `residual` 先逐元素相加得到 `z`，再按行独立计算均方根归一化（RMSNorm），最后乘上长度为 `C` 的通道缩放权重 `weight` 写回输出矩阵 `out`。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-用官方单行 4 元素的例子看清三步计算：`x = [1.0, 0.0, -1.0, 2.0]`，`residual = [0.5, 1.5, 0.5, -0.5]`，`weight = [1.0, 2.0, 1.0, 0.5]`，`eps = 1e-5`：
-1. **残差相加**：对应位置相加得到 `z = [1.5, 1.5, -0.5, 1.5]`。
-2. **求行内缩放系数**：平方和为 `2.25 + 2.25 + 0.25 + 2.25 = 7.0`，均方值 `7.0 / 4 = 1.75`，均方根 `sqrt(1.75 + 1e-5) ≈ 1.32288`，取倒数得到 `inv_rms ≈ 0.75593`。
-3. **归一化并乘权重**：每个 `z[j]` 乘上 `inv_rms * weight[j]`，输出 `[1.13389, 2.26778, -0.37796, 0.56695]`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline
+> baseline：按级启动的多遍全局蝶形变换
 
-每行计算互不依赖，直接让 1 个线程块（block，256 个线程）负责 1 行。第一遍循环读入 `x` 和 `residual` 累加平方和，先用线程束洗牌指令 `__shfl_down_sync` 在 32 线程组成的线程束（warp）内求和，再借片上共享内存（shared memory）汇总 8 个 warp 的部分和，由 0 号线程算出整行的 `inv_rms`；第二遍循环重新读取 `x` 和 `residual`，乘上 `inv_rms * weight[j]` 写回：
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-float sum_sq = 0.0f;
-for (int j = tid; j < C; j += kThreads) {
-    float z = row_x[j] + row_res[j];
-    sum_sq = fmaf(z, z, sum_sq);
-}
-// 块内 warp + shared memory 归约得到 s_inv_rms ...
-float inv_rms = s_inv_rms;
-for (int j = tid; j < C; j += kThreads) {
-    float z = row_x[j] + row_res[j];
-    row_out[j] = z * inv_rms * weight[j];
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
 }
 ```
 
-> optimized：寄存器常驻单遍访存
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-看官方计时形状 `N = 4,096, C = 4,096` 的显存账：`x`、`residual`、`out` 各占 `64 MiB`。双遍版第一遍读入 `x` 和 `residual` 共 `128 MiB`，远超 T4 的 `4 MiB` 二级缓存（L2 cache）容量，旧数据在第一遍结束前已被冲刷出缓存；第二遍写回前只能从全局显存再读一遍 `x` 和 `residual`（又多出 `128 MiB`），整道算子总显存流量高达 `320 MiB`。
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-单行的 `C = 4,096` 个浮点数只占 `16 KiB`。让一个块内的 `256` 个线程以 `float4`（单条 128 位指令一次读写 4 个连续 `float`）向量化加载，每个线程恰好分担 `4,096 / 256 = 16` 个浮点数，即 **4 个 `float4` 寄存器**。第一遍算出 `z = x + residual` 后直接留在各自的寄存器里，块内归约拿到 `inv_rms` 后立刻从寄存器取出 `z`，配合只读数据缓存指令 `__ldg` 读取仅占 `16 KiB` 的共享权重 `weight`，以 `float4` 连续合并写回 `out`：
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
+
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
 
 ```cuda
-const float4 x0 = x4[row_base + tid],       r0 = res4[row_base + tid];
-const float4 x1 = x4[row_base + tid + 256], r1 = res4[row_base + tid + 256];
-const float4 x2 = x4[row_base + tid + 512], r2 = res4[row_base + tid + 512];
-const float4 x3 = x4[row_base + tid + 768], r3 = res4[row_base + tid + 768];
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
 
-// z0..z3 常驻寄存器，块内归约得到 inv_rms 后直接写回，省去第二遍全局重读
-const float inv_rms = block_inv_rms<256>(sum_sq, 1.0f / 4096.0f, eps);
-
-const float4 w0 = __ldg(&weight4[tid]);
-out4[row_base + tid] = make_float4(
-    (z0.x * inv_rms) * w0.x, (z0.y * inv_rms) * w0.y,
-    (z0.z * inv_rms) * w0.z, (z0.w * inv_rms) * w0.w);
-// 同理写回 +256, +512, +768 处的 z1, z2, z3 ...
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
 ```
 
-0.85 ms 97.1th percentile (T4)
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
 
-这样每行只读一次 `x` 和 `residual`、写一次 `out`，直接省掉 `128 MiB` 的重复显存读取，总流量从 `320 MiB` 降到理论下限 `192 MiB`。每个线程仅占用 48 个寄存器且零寄存器溢出（zero spill），单个流式多处理器（SM）可同时驻留 4 个线程块（共 1,024 个活跃线程）隐藏访存延迟。完整实现按行宽 `C` 分档调度：`C <= 8,192` 走寄存器常驻单遍模板，`8,192 < C <= 12,224` 走动态共享内存单遍缓存，超宽行或非 16 字节对齐输入自动回退至双遍路径，覆盖题目 `1 <= C <= 65,536` 全范围。
-
-本地 Tesla T4（CUDA 12.4）每次计时前刷空 L2 缓存，在官方计时规模 `N = 4,096, C = 4,096` 下取 15 轮中位数：双遍基线耗时 `1.1145 ms`，寄存器常驻单遍版降至 **`0.6943 ms`**（提速 **1.61 倍**，单遍有效带宽达 `290.0 GB/s`）。LeetGPU 官方 Tesla T4 首次提交即通过全部测试，耗时 **`0.85 ms`（第 `97.1` 百分位）**。
-
-完整代码：[双遍基线](./solutions/normalization/fused-residual-rmsnorm-baseline.cu) · [寄存器常驻单遍优化](./solutions/normalization/fused-residual-rmsnorm-opt.cu)
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
