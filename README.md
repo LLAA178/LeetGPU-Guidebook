@@ -2238,8 +2238,8 @@ __global__ void attn(const float* qkv, float* output, const float* weights, int 
    - 当 `D != 128` 或指针未 16 字节对齐时，自动回退到通用 Warp 级 Online Softmax 内核，保证所有约束范围（`1 <= M, N <= 4096, 1 <= H <= 64, 1 <= D <= 256`）全部正确通过。
 
 **实测结果（官方基准 `M=1024, N=2048, H=16, D=128`）**：
-- 基线版（`multi_head_cross_attention_baseline.cu`）：中位耗时 **51.117 ms**（0.34 TFLOPS）
-- 优化版（`multi_head_cross_attention_opt.cu`）：中位耗时 **11.394 ms**（1.51 TFLOPS），相比基线加速 **4.49×**，全部功能用例及基准抽检与 FP64 CPU 参考实现最大绝对误差 `2.16e-7`（远小于 `1e-4` 容差）。
+- 基线版（`multi_head_cross_attention_baseline.cu`）：本地中位耗时 **51.117 ms**（0.34 TFLOPS）
+- 优化版（`multi_head_cross_attention_opt.cu`）：本地中位耗时 **11.394 ms**（1.51 TFLOPS），相比基线加速 **4.49×**，全部功能用例及基准抽检与 FP64 CPU 参考实现最大绝对误差 `2.16e-7`（远小于 `1e-4` 容差）；LeetGPU 平台 T4 实测 **13.50 ms，第 92.3 百分位**。
 
 完整代码：
 - 基线版：[`solutions/transformer/multi_head_cross_attention_baseline.cu`](./solutions/transformer/multi_head_cross_attention_baseline.cu)
