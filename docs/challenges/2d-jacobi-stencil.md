@@ -39,6 +39,6 @@ store_streaming_float4(&out4[r0 * sw4 + c4], out0);
 store_streaming_float4(&out4[r1 * sw4 + c4], out1);
 ```
 
-在官方性能测试规模 `8,192 × 8,192` 下（每次计时前刷空二级缓存，取 15 轮中位数），双行 `float4` 流式版与基线均跑满显存带宽上限，实测中位耗时 **`1.89 ms`**（等效单读单写有效带宽达 **`283.6 GB/s`**）。
+在官方性能测试规模 `8,192 × 8,192` 下（每次计时前刷空二级缓存，取 15 轮中位数），双行 `float4` 流式版与基线均跑满显存带宽上限，实测中位耗时 **`1.89 ms`**（等效单读单写有效带宽达 **`283.6 GB/s`**）；在 LeetGPU 官方 T4 评测中一次通过全部测试，耗时 **2.29 ms**（第 **93.0** 百分位）。
 
 完整代码：[`2d-jacobi-stencil-baseline.cu`](../../solutions/convolution/2d-jacobi-stencil-baseline.cu) · [`2d-jacobi-stencil-opt.cu`](../../solutions/convolution/2d-jacobi-stencil-opt.cu)
