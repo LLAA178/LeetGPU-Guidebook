@@ -1351,11 +1351,13 @@ extern "C" void solve(const float* input, float* output, int N) {
 ### [general-matrix-multiplication](https://leetgpu.com/challenges/general-matrix-multiplication-gemm)
 *环境: CUDA，Tensor Core 版本需要 SM 7.5 或更高架构*
 
-计算通用矩阵乘加 `C = alpha * (A @ B) + beta * C`，输入输出均为行主序 FP16（`half`），点积在 FP32 中累加，写回时转换为 FP16。题面计时形状为 `M = N = K = 1024`。
+这题要算半精度浮点（FP16）通用矩阵乘加 `C = alpha * (A × B) + beta * C`。输入和输出矩阵都是 FP16，中间点积用单精度浮点（FP32）累加保证精度，最后转回 FP16 写回。
+
+举个小例子：假设 `M = N = K = 1024`，如果每个线程独立算 `C` 里的 1 个数，每算 1 个输出就要从显存读 2048 个半精度数，算力单元大部分时间都在等数据。
 
 > baseline
 
-每个线程负责一个输出元素，沿 `K` 累加 FP32 点积，最后应用 `alpha` 与 `beta`（`beta == 0` 时跳过读取原 `C`）并写回 `half`。
+每个线程负责 1 个输出元素，沿 `K` 累加 FP32 点积，最后乘以 `alpha` 并加上 `beta * C`（`beta == 0` 时跳过读取原 `C`）。
 
 ```CUDA
 float acc = 0.0f;
@@ -1369,12 +1371,12 @@ C[c_idx] = __float2half(out);
 
 > tensor core
 
-针对 `M、N` 为 64 的倍数、`K` 为 32 的倍数且地址对齐的形状，采用双缓冲共享内存 + `ldmatrix.x4` + `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32`：
-- **分块与双缓冲**：每块 4 个 warp（128 线程）计算 `64×64` 输出（每 warp `32×32`），沿 `K` 每次推进 `32`。线程以 `uint4`（16 字节 / 8 个 `half`）协作搬运 `A/B` 块，并在计算当前共享内存阶段的同时将下一阶段预取到寄存器，隐藏全局访存延迟（适配 SM 7.5 T4，无需 `cp.async`）。
-- **无 bank 冲突与 `ldmatrix.x4`**：共享内存行步长加 8 个 `half`（16 字节）padding；每个 `k=8` 子步仅用 1 条 `ldmatrix.m8n8.x4` 读取两块 `16×8` 的 `A` 和 1 条 `ldmatrix.m8n8.x4.trans` 读取四块 `8×8` 的 `B`。
-- **`half2` 直写尾声**：按 `m16n8k8` 输出布局直接以 `half2` 写回 `C`，`beta == 0` 时跳过读 `C`，零共享内存输出中转、零寄存器溢出（0 spill，105 regs）。其余形状或未对齐输入回退到标量基线。
+为了把 T4 的矩阵计算单元（Tensor Core）跑满，优化版对整除且对齐的形状做了三步加速（其余边界形状自动走标量版）：
+- **分块与双缓冲预取**：一个线程块（4 个线程束、128 线程）负责 `64×64` 的输出块，沿 `K` 每次推进 32。线程用 `uint4`（一次 16 字节、8 个 FP16）把 `A/B` 搬进共享内存（片上高速缓存），在计算当前块的同时把下一块提前读进寄存器，把访存延迟藏在计算后面。
+- **`ldmatrix.x4` 批量加载**：共享内存每行多留 8 个 FP16 的空位（padding）避免存储体冲突（bank conflict）；每个 `k = 8` 子步只需 2 条 `ldmatrix.x4`（片上矩阵加载指令），就能把 2 块 `A` 和 4 块 `B` 一次喂给 `mma.sync` 矩阵乘加指令。
+- **`half2` 直接写回**：按 `m16n8k8` 的输出布局，每个线程正好握着相邻两个元素，算完 `alpha/beta` 后直接用 `half2` 写回 `C`，省掉共享内存中转，`beta == 0` 时也不读原 `C`。
 
-该双缓冲 MMA 优化版已通过 LeetGPU 官方 T4 全部测试（All tests passed），平台耗时 **0.29 ms**，第 **95.6 百分位**（提交当时榜单，排行榜实时浮动）。本地 T4 单 kernel 微基准中，`1024×1024×1024`（`beta=0`）中位耗时由基线 `3.74 ms` 降至 `0.105 ms`（约 `20.5 TFLOPS`）。
+优化版在 LeetGPU 官方 T4 上通过全部测试，耗时 **0.29 ms**（第 **95.6** 百分位）；本地 T4 对照测试中，基线版 `1024×1024×1024` 耗时 `3.74 ms`，优化版降至 `0.105 ms`（快了 35 倍）。
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
