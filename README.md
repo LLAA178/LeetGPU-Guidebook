@@ -15,15 +15,15 @@
 | --- | --- | --- |
 | [vector-addition](#vector-addition) | [reduction](#reduction) | [multi-head-attention](#multi-head-attention) |
 | [matrix-multiplication](#matrix-multiplication) | [softmax](#softmax) | [gpt-2-transformer-block](#gpt-2-transformer-block) |
-| [matrix-transpose](#matrix-transpose) | [dot-product](#dot-product) | [causal-self-attention](#causal-self-attention) |
+| [matrix-transpose](#matrix-transpose) | [dot-product](#dot-product) |  |
 | [color-inversion](#color-inversion) | [parallel-merge](#parallel-merge) |  |
 | [1d-convolution](#1d-convolution) | [int8-quantized-matmul](#int8-quantized-matmul) |  |
 | [reverse-array](#reverse-array) | [batch-normalization](#batch-normalization) |  |
 | [relu](#relu) | [rotary-positional-embedding](#rotary-positional-embedding) |  |
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
-| [matrix-copy](#matrix-copy) |  |  |
-| [count-array-element](#count-array-element) |  |  |
+| [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -1994,6 +1994,98 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 
 完整代码：[`solutions/quantization/weight-dequantization.cu`](./solutions/quantization/weight-dequantization.cu)
 
+### [general-matrix-multiplication](https://leetgpu.com/challenges/general-matrix-multiplication-gemm)
+*环境: CUDA，Tensor Core 版本需要 SM 7.5 或更高架构*
+
+这题要算半精度浮点（FP16）通用矩阵乘加 `C = alpha * (A × B) + beta * C`。输入和输出矩阵都是 FP16，中间点积用单精度浮点（FP32）累加保证精度，最后转回 FP16 写回。
+
+举个小例子：假设 `M = N = K = 1024`，如果每个线程独立算 `C` 里的 1 个数，每算 1 个输出就要从显存读 2048 个半精度数，算力单元大部分时间都在等数据。
+
+> baseline
+
+每个线程负责 1 个输出元素，沿 `K` 累加 FP32 点积，最后乘以 `alpha` 并加上 `beta * C`（`beta == 0` 时跳过读取原 `C`）。
+
+```CUDA
+float acc = 0.0f;
+for (int k = 0; k < K; ++k) {
+    acc = fmaf(__half2float(a_row[k]), __half2float(B[static_cast<size_t>(k) * N + col]), acc);
+}
+float out = alpha * acc;
+if (beta != 0.0f) out = fmaf(beta, __half2float(C[c_idx]), out);
+C[c_idx] = __float2half(out);
+```
+
+> tensor core
+
+为了把 T4 的矩阵计算单元（Tensor Core）跑满，优化版对整除且对齐的形状做了三步加速（其余边界形状自动走标量版）：
+- **分块与双缓冲预取**：一个线程块（4 个线程束、128 线程）负责 `64×64` 的输出块，沿 `K` 每次推进 32。线程用 `uint4`（一次 16 字节、8 个 FP16）把 `A/B` 搬进共享内存（片上高速缓存），在计算当前块的同时把下一块提前读进寄存器，把访存延迟藏在计算后面。
+- **`ldmatrix.x4` 批量加载**：共享内存每行多留 8 个 FP16 的空位（padding）避免存储体冲突（bank conflict）；每个 `k = 8` 子步只需 2 条 `ldmatrix.x4`（片上矩阵加载指令），就能把 2 块 `A` 和 4 块 `B` 一次喂给 `mma.sync` 矩阵乘加指令。
+- **`half2` 直接写回**：按 `m16n8k8` 的输出布局，每个线程正好握着相邻两个元素，算完 `alpha/beta` 后直接用 `half2` 写回 `C`，省掉共享内存中转，`beta == 0` 时也不读原 `C`。
+
+优化版在 LeetGPU 官方 T4 上通过全部测试，耗时 **0.29 ms**（第 **95.6** 百分位）；本地 T4 对照测试中，基线版 `1024×1024×1024` 耗时 `3.74 ms`，优化版降至 `0.105 ms`（快了 35 倍）。
+
+完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
+
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
+*环境: CUDA*
+
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
+
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
+
+> baseline：按级启动的多遍全局蝶形变换
+
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
+
+```cuda
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
+}
+```
+
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
+
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
+
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
+
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
+
+```cuda
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
+```
+
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
+
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
+
 ## 困难题
 
 ### [multi-head-attention](https://leetgpu.com/challenges/multi-head-attention)
@@ -2220,61 +2312,3 @@ __global__ void attn(const float* qkv, float* output, const float* weights, int 
 - attention 的 `(token, head, dim)` 映射怎么落到 kernel
 
 完整代码：[`solutions/transformer/gpt-2-transformer-block.cu`](./solutions/transformer/gpt-2-transformer-block.cu)
-
-### [causal-self-attention](https://leetgpu.com/challenges/causal-self-attention)
-*环境: CUDA*
-
-一句话：给定形状为 `M×d` 的 `Q`、`K`、`V`，为第 `i` 个查询位置只对“它自己和之前的键”（`j <= i`）做缩放点积和按行 softmax，再用得到的权重对 `V` 加权求和，相当于把自注意力矩阵的上三角全部遮掉。
-
-举个小例子（`M=2, d=2`）：第 0 行查询只能看到第 0 个键，softmax 权重固定是 `[1.0]`，输出直接等于 `V[0]`；第 1 行查询可以看到第 0、1 两个键，先算出两个缩放点积再做 softmax，把 `V[0]` 和 `V[1]` 按权重混合。
-
-> baseline
-
-每个 warp（线程束，GPU 上同步执行的 32 个线程）负责一行 `Q`，顺序遍历 `0..q_row` 的每一行 `K` 和 `V`，用 Online Softmax（在线 softmax，一边扫一边维护当前最大值和指数和，省去把 `M×M` 注意力分数矩阵写回显存的开销）流式更新输出。
-
-```CUDA
-for (int k_row = 0; k_row <= q_row; ++k_row) {
-    float dot = 0.0f;
-    for (int i = 0; i < elems; ++i) {
-        const int col = lane + i * 32;
-        if (col < d) dot = fmaf(q_reg[i], k_ptr[col], dot);
-    }
-    float score = __shfl_sync(0xffffffff, warp_reduce_sum(dot), 0);
-    float m_new = fmaxf(m, score);
-    float alpha = __expf(m - m_new);
-    float p = __expf(score - m_new);
-    l = l * alpha + p;
-    for (int i = 0; i < elems; ++i) {
-        const int col = lane + i * 32;
-        if (col < d) o_reg[i] = fmaf(p, v_ptr[col], o_reg[i] * alpha);
-    }
-    m = m_new;
-}
-```
-
-> optimized
-
-baseline 里每个 warp 每次只算一行 `Q`，`K` 和 `V` 都要反复从 global memory（全局显存）读；优化版改用 FlashAttention 分块思路：一个 256 线程的 block（线程块，组织成 `16×16`、共 8 个 warp）一次处理 `Br=64` 行 `Q`，每个线程同时维护 4 行 `Q` 的累加器，每次把 `Bc=32` 行 `K` 或 `V` 搬进 shared memory（片上共享内存，速度远快于全局显存）复用，并用 `float4`（一次读写 4 个 `float` 的 128 位向量指令）加速 `Q/K/V` 与中间权重表 `sP` 的访存。同时利用因果掩码做了三处优化：
-- **外层分块提前终止**：当 `k_start > q_max_row` 时直接结束循环，整块跳过上三角的无效 `K/V` 搬运与计算。
-- **内部完整分块无分支路径**：当 `k_start + Bc - 1 <= q_block_row` 时，整个分块全部位于下三角，去掉内层逐元素掩码判断。
-- **逆序 block 调度**：从最大的查询行分块开始发射，让计算量最重的 block 先跑，消除尾部波次的负载不均衡。
-
-```CUDA
-const int q_block_idx = gridDim.x - 1 - blockIdx.x;  // 逆序调度，重负载 block 先跑
-for (int k_start = 0; k_start <= q_max_row; k_start += kBc) {
-    // 1. float4 协作加载 K 分块到 shared memory
-    // 2. 内部完整分块走无分支路径，对角分块施加 j <= q_row 掩码；每份 K float4 复用 4 行 Q
-    // 3. 16 线程子束内用 shuffle 归约完成 Online Softmax，写回 sP
-    // 4. float4 协作加载 V 分块到 shared memory，float4 读取 sP 并把每份 V float4 复用 4 行 Q
-}
-```
-
-> 省了哪一步与实测效果
-- **64 行共享片上分块 + 4 倍寄存器复用**：64 行 `Q` 共享同一份片上 `K/V` 分块，每个线程同时算 4 行 `Q`，并按 4 个元素一组用 `float4` 读 `sP`，大幅降低全局显存与片上访存压力。
-- **因果剪枝与负载均衡**：按块跳过上三角分块、内部块去分支、逆序发射重负载 block，减少无效计算与尾部等待。
-- **本地实测**：在 `M=5000, d=64` 上，优化版从 `15.323 ms` 降到 `1.526 ms`（提速 `10.04x`）；在 `M=5000, d=128` 上，从 `22.766 ms` 降到 `2.693 ms`（提速 `8.45x`），数值误差均小于 `5e-7`。
-- **LeetGPU 平台实测（T4）**：`v1`（`Br=8`）`18.72 ms`（第 73.8 百分位）→ `v2`（`Br=32`，4 倍寄存器复用 + 逆序调度）`9.05 ms`（第 89.4 百分位）→ `v3`（`Br=64`，64 KB 动态共享内存 + `float4` 读 `sP`）`7.31 ms`（第 90.7 百分位），全部用例通过。
-
-完整代码：
-- baseline：[`solutions/transformer/causal_self_attention_baseline.cu`](./solutions/transformer/causal_self_attention_baseline.cu)
-- optimized：[`solutions/transformer/causal_self_attention_opt.cu`](./solutions/transformer/causal_self_attention_opt.cu)
