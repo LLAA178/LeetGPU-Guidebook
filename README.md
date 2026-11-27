@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [top-p-sampling](#top-p-sampling) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,54 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [top-p-sampling](https://leetgpu.com/challenges/top-p-sampling)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-对长度为 `vocab_size` 的词表分数 `logits`，先算 Softmax 概率并按“概率从大到小、概率相同时词表下标从小到大”排序，截取累计概率首次达到阈值 `p[0]` 的最小前缀集合（核集合 Nucleus），重归一化后用 `seed[0]` 驱动的 PCG 哈希与指数竞赛公式选出获胜词元写入 `sampled_token[0]`。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-用官方 4 词元例子 `logits = [1.0, 2.0, 3.0, 0.5]`、`p = 0.9`、`seed = 42` 走一遍完整流程：
-1. **转成概率并稳定降序排列**：Softmax 概率依次约为 `[0.0853, 0.2320, 0.6310, 0.0518]`；按概率降序排好后，词元下标顺序为 `[2, 1, 0, 3]`，对应概率 `[0.6310, 0.2320, 0.0853, 0.0518]`。
-2. **截取核集合并重归一化**：从前往后累加概率，前两个词元和为 `0.8630 < 0.9`，加上第 3 个词元（下标 `0`）后达到 `0.9483 >= 0.9`，于是核集合锁定为 `[2, 1, 0]`，各自除以三者总和 `0.9483` 得到重归一化概率 `q ≈ [0.6654, 0.2446, 0.0900]`。
-3. **PCG 哈希指数竞赛采样**：对核内每个词元下标 `i` 计算 `u_i = (pcg(pcg(seed) + i) + 0.5) / 2^32`，比较竞赛得分 `q_i / (-ln u_i)`：词元 `2`、`1`、`0` 的得分依次约为 `0.1249`、`0.1791`、`0.2079`，词元 `0` 得分最高胜出，输出 `sampled_token[0] = 0`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline
+> baseline：按级启动的多遍全局蝶形变换
 
-为了把“概率降序、平局按下标升序”的稳定排序压成单次无分支整数比较，先把单精度概率映射成保序无符号整数，高 32 位存概率、低 32 位存按位取反的下标 `~idx` 拼成 `uint64_t` 键值。基线版算出全词表概率后，在全局显存上对整张词表做完整的双调排序（Bitonic Sort，规模补齐到 `2` 的幂），再扫描前缀和找出截断点并完成指数竞赛：
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-// 高 32 位存保序浮点概率，低 32 位存 ~idx：单次无符号降序比较即等价于 (prob DESC, idx ASC)
-__device__ uint64_t pack_desc_prob_asc_idx(float prob, int idx) {
-    uint32_t u = __float_as_uint(prob);
-    uint32_t ord = (u & 0x80000000u) ? (~u) : (u ^ 0x80000000u);
-    return (static_cast<uint64_t>(ord) << 32) | static_cast<uint64_t>(~static_cast<uint32_t>(idx));
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
 }
 ```
 
-> optimized：分箱概率质量过滤 + 片上共享内存核排序
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-看官方计时规模 `vocab_size = 50,000`（标准差为 `3.0` 的正态分布，`p = 0.9`）：若像基线版那样补齐到 `65,536` 做全局双调排序，一共要启动 `16 × 17 / 2 = 136` 次排序核函数；但实际上 `90%` 的概率质量集中在头部约 `600` 个高分词元里，剩下 `98%` 以上的长尾词元根本进不了核集合。
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-优化版直接在二级缓存（L2 cache，`50,000` 个浮点数仅占 `200 KB`）和片上共享内存（shared memory）里把无效排序砍掉，且全程留在 GPU 端执行（读取设备指针 `p[0]` 与 `seed[0]` 零主机同步）：
-- **第一趟（`float4` 在线归约 `max_logit` 与指数和）**：用 128 位向量加载单遍算出全局最大分数和归一化分母，最后一个退役块写回全局标量。
-- **第二趟（512 桶对数间距直方图定位截断桶）**：按与最大分数的差距 `delta = max_logit - logits[i]` 以 `1/32` 为步长划出 `512` 个分桶，在共享内存统计每个桶的概率质量与词元个数。扫一遍这 `512` 个桶就能立刻锁定累计概率首次跨过 `p[0]` 的截断桶 `cut_bin`，把排在后面的数万个低概率长尾词元一次性筛除。
-- **第三趟（候选提取与片上精确排序采样）**：只把落在 `0 .. cut_bin` 内的候选词元（典型规模仅数百个）提取出来打包成 `uint64_t` 键值，放进单块 `32 KiB` 片上共享内存完成排序、单精度累计和截断与双精度 PCG 指数竞赛。遇到极端全相等词表导致候选数超过 `4,096` 时，单线程块直接在二级缓存常驻缓冲区内完成全线程对齐的双调排序兜底，保证包括平局保序在内的所有边界与参考实现逐位一致：
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
+
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
 
 ```cuda
-// 只提取落在截断桶 cut_bin 以内的头部高概率候选词元（典型仅数百个，直接省去 98%+ 长尾排序）
-const float x = __ldg(&logits[i]);
-if (logit_to_bin(x, max_l) <= cut_bin) {
-    const float prob = expf(x - max_l) * inv_z;
-    const unsigned int pos = atomicAdd(&g_cand_write_pos, 1u);
-    g_cand_keys[pos] = pack_prob_idx(prob, i);
-}
-// 随后单线程块在片上共享内存完成候选排序、精确 float32 累计和截断与双精度 PCG 指数竞赛
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
 ```
 
-词表规模 `vocab_size <= 4,096` 时，入口直接走单块全片上核函数 **1 次启动**完成全部步骤；大词表走上述异步分箱过滤管线，零 `cudaMalloc`、零主机同步。
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
 
-优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **0.52 ms**（第 **95.7** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方计时规模 `vocab_size = 50,000`（`p = 0.9`）下取 15 轮中位数，全词表双调排序基线耗时 `0.3818 ms`，分箱过滤片上排序版降至 **`0.1638 ms`**（提速 **`2.33x`**）。
-
-完整代码：[全词表排序基线](./solutions/reduction/top-p-sampling-baseline.cu) · [分箱过滤片上核排序优化](./solutions/reduction/top-p-sampling-opt.cu)
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
