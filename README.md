@@ -2247,6 +2247,11 @@ __global__ void attn(const float* qkv, float* output, const float* weights, int 
 | Baseline（Warp Online Softmax） | `1.788e-07` | `0.0943 ms` | `1.00×` |
 | Optimized（单次加载共享窗口 + 寄存器双遍 Softmax） | `1.490e-07` | `0.0452 ms` | `2.09×` |
 
+**LeetGPU 平台成绩（T4）**
+
+- 第一版（分块共享内存循环 + 4× 行复用）：`0.25 ms`，第 `67.5` 百分位
+- 第二版（单次加载共享窗口 + 零栈帧寄存器双遍 Softmax）：`0.13 ms`，第 `98.7` 百分位（耗时缩短 `48%`）
+
 完整代码：
 - 基线版：[`solutions/transformer/sliding_window_self_attention_baseline.cu`](./solutions/transformer/sliding_window_self_attention_baseline.cu)
 - 优化版：[`solutions/transformer/sliding_window_self_attention_opt.cu`](./solutions/transformer/sliding_window_self_attention_opt.cu)
