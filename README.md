@@ -1756,13 +1756,15 @@ __global__ void accumulate_stats_tiled_kernel(const float* input,
 完整代码：[`solutions/normalization/batch-normalization.cu`](./solutions/normalization/batch-normalization.cu)
 
 ### [grouped-query-attention](https://leetgpu.com/challenges/grouped-query-attention)
-*环境: CUDA，TF32 Tensor Core 路径需要 SM 8.0 或更高架构*
+*环境: CUDA，Tensor Core 路径需要 SM 8.0 或更高架构*
 
-Grouped Query Attention（GQA）将 `num_q_heads` 个 Query 头均匀分为 `num_kv_heads` 组，每组连续 `G = num_q_heads / num_kv_heads` 个 Query 头共享同一组 `K[h_kv]` 和 `V[h_kv]`。所有张量均为 `float32`，按 `[head, seq_len, head_dim]` 行主序排列；缩放因子为 `1 / sqrt(head_dim)`，沿 key 维度做完整双向 softmax。题面计时形状为 `num_q_heads=32, num_kv_heads=8, seq_len=1024, head_dim=128`。
+这题要算分组查询注意力（GQA）：把 `num_q_heads` 个查询头（Q）均分成 `num_kv_heads` 组，每组共享同一份键（K）和值（V），按 `softmax(Q × K^T / sqrt(head_dim)) × V` 算出输出，所有张量都是单精度浮点（FP32）。
+
+举个小例子：假设有 4 个 Q 头、2 个 KV 头，那么 `Q[0], Q[1]` 都去查 `K[0], V[0]`，`Q[2], Q[3]` 都去查 `K[1], V[1]`。如果先把完整的 `seq_len × seq_len` 注意力分数表写回全局显存再做 softmax，读写量会非常大。
 
 > baseline
 
-每个 warp 负责一个 `(q_head, q_row)` 输出行，线程沿 `head_dim` 分摊（`head_dim <= 256` 时每线程最多 8 个元素），将预缩放后的 `Q` 行与累加器 `O` 常驻寄存器。遍历所有 `k_row` 时用 warp shuffle 归约点积，并在线维护 `(m, l)` 完成单遍 Online Softmax，避免在全局内存落地 `S×S` 注意力矩阵。
+每个线程束（warp，32 个线程）负责一个 Q 头里的一行输出，把这一行 `Q` 和输出累加器 `O` 留在寄存器里。遍历 `K/V` 的每一行时，用 Online Softmax（在线归一化）一边扫一边更新当前最大值 `m` 和指数和 `l`，最后统一除以 `l`，全程不需要把分数表写进显存。
 
 ```CUDA
 float m_new = fmaxf(m, score);
@@ -1777,13 +1779,12 @@ m = m_new;
 
 > optimized
 
-针对 `head_dim = 128` 且 SM 8.0+（A100）采用 FlashAttention-2 分块与 TF32 Tensor Core 路径：
-- **分块与寄存器常驻**：每块 4 个 warp（128 线程）负责 `B_r = 64` 行 Query（每 warp 16 行），沿 `seq_len` 以 `B_c = 64` 分块流式遍历 `K/V`。`Q` 预缩放并转为 TF32 常驻寄存器，`O` 累加器常驻 FP32 寄存器，无任何寄存器溢出（`0 bytes spill`）。
-- **异步搬运与 bank 冲突消除**：使用 `cp.async.ca.shared.global` 以 16 字节为单位将 `K/V` 块搬入共享内存，行步长加 4 个 float padding（`132`）消除 shared memory bank 冲突。
-- **纯寄存器 Online Softmax 与 3-MMA TF32 拆分**：`Q @ K^T` 与 `P @ V` 均调用 `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`。单次 TF32（10-bit 尾数）在 `D=128` 累加下存在约 `3.5e-4` 截断误差，因此对 `Q/K` 和 `P/V` 均做 `x = x_hi + x_lo` 双 TF32 拆分，以 `hi·hi + hi·lo + lo·hi` 三条 MMA 累加到 FP32，兼顾 Tensor Core 吞吐与 FP32 精度。由于 MMA 输出布局中同一行的元素恰好分布在 4 个同组 lane 上，Online Softmax 的行最大值与行和归约仅需两次 `__shfl_xor_sync`（步长 1、2），完全不经过共享内存；随后先对 `s0..s3` 分别 `__shfl_sync` 再按目标 lane 的奇偶列选择，即可直接作为 `P @ V` 的 `A` 片段。
-- **通用回退路径**：SM < 8.0（如 T4）或 `head_dim != 128` 时回退到 8-warp、`B_c = 16` 的共享内存分块 FP32 FlashAttention 路径（共享内存 ≤ 33 KB，兼容所有 `8 <= head_dim <= 256`）。
+基线版每次只算一行 Q，每行都要重新从显存读一遍完整的 `K/V`。优化版针对 `head_dim = 128` 做了三件事把速度提上去：
+- **分块复用 `K/V`**：一个线程块（4 个线程束）一次处理 64 行 `Q`，沿序列长度每次把 64 行 `K/V` 用 `cp.async`（异步拷贝指令）搬进共享内存（片上高速缓存），64 行 `Q` 共享同一块 `K/V`，显存读取量大幅下降。
+- **3-MMA TF32 拆分**：A100 的矩阵计算单元（Tensor Core）原生支持 TF32（10 位尾数，速度是普通 FP32 的 8 倍），但单次 TF32 截断在 `head_dim = 128` 下会产生约 `3.5e-4` 误差。把每个 FP32 数拆成高位和低位两段 TF32（`x = x_hi + x_lo`），用 `hi·hi + hi·lo + lo·hi` 三条矩阵乘加指令累加到 FP32，既保住 FP32 精度，又保留了 Tensor Core 的高吞吐。
+- **纯寄存器做 Softmax**：矩阵乘加的输出布局里，同一行的元素恰好分布在 4 个同组线程上。行最大值和行和只需两次线程束内洗牌（`__shfl_xor_sync`）就能算完，完全不经过共享内存。SM 8.0 以下或其他维度自动回退到共享内存分块的 FP32 路径。
 
-该 FlashAttention-2 + 3-MMA TF32 优化版已通过 LeetGPU 官方 A100-80GB 全部测试（All tests passed），平台耗时 **1.23 ms**，第 **94.7 百分位**（提交当时榜单，排行榜实时浮动）。
+优化版在 LeetGPU 官方 A100-80GB 上通过全部测试，耗时 **1.23 ms**（第 **94.7** 百分位）。
 
 完整代码：[Online Softmax 基线版](solutions/transformer/grouped_query_attention_baseline.cu) · [FlashAttention-2 + 3-MMA TF32 优化版](solutions/transformer/grouped_query_attention_flash.cu)
 
