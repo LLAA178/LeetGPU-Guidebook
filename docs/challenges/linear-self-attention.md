@@ -46,6 +46,7 @@ if (q_load_k4 == 0) sDenom[q_load_m] += d_part;
 - **沿 `M` 维切分并行 + 片上复用**：阶段一把 `10000` 行的串行扫描拆给 80 个 block 并行完成，并用 `float4` 和 `4×4` 寄存器分块把 `K`/`V` 的全局显存读取次数大幅压缩。
 - **单遍融合分母归约 + 消除 bank conflict**：阶段二在加载 `Q` 的同时完成 `φ(Q) z` 归约，并用 `sQ[16][65]` 填充布局消除片上存储体冲突，两个 kernel 均为 0 寄存器溢出（0 spill）。
 - **本地实测（`M=10000, d=128`）**：baseline 平均 `2.1514 ms`，优化版降至 `0.2472 ms`（提速 `8.70x`），与 FP64 CPU 参考结果的最大绝对误差为 `9.537e-7`（全部功能与边界用例通过）。
+- **LeetGPU 平台实测（T4）**：`0.68 ms`（第 96.5 百分位），全部用例通过。
 
 完整代码：
 - baseline：[`solutions/transformer/linear_self_attention_baseline.cu`](../../solutions/transformer/linear_self_attention_baseline.cu)
