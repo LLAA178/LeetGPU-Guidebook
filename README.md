@@ -9,6 +9,10 @@
 - [章节笔记](docs/cuda-best-practices/README.md)
 - [实验文档](docs/cuda-best-practices/experiments/README.md)
 
+## 逐题独立题解
+
+- [`docs/challenges/`](docs/challenges/)：浏览新增题解，每题一篇。
+
 ## 索引
 
 | 简单题 | 中等题 | 困难题 |
