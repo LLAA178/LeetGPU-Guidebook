@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [stream-compaction](#stream-compaction) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,55 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [stream-compaction](https://leetgpu.com/challenges/stream-compaction)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-按原顺序挑出输入数组中所有大于 `0` 的浮点数，紧凑写到输出数组开头（平台已将输出预置为 `0`，尾部无需补写）。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-举个例子：输入 `[1, -2, 3, 0, -1, 4]`，挑出正数后输出 `[1, 3, 4, 0, 0, 0]`。并行化的核心难点在于：每个正数的写入下标等于**它前面一共有多少个正数**。如果把数组切成两块 `[1, -2, 3]` 和 `[0, -1, 4]`：
-1. **块内统计**：第 0 块有 `2` 个正数，第 1 块有 `1` 个正数。
-2. **扫描块偏移**：对块计数 `[2, 1]` 求排他前缀和（exclusive scan，即每项等于前面各项之和），得到每块的全局写入起点 `[0, 2]`。
-3. **块内紧凑写回**：第 1 块知道前面共有 `2` 个正数，就把自己唯一的正数 `4` 写到 `output[2 + 0]`，各块互不干扰且严格保持原顺序。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline
+> baseline：按级启动的多遍全局蝶形变换
 
-单线程从左到右扫描，用 `next` 记录下一个写入位置：
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-int next = 0;
-for (int i = 0; i < n; ++i) {
-    float v = input[i];
-    if (v > 0.0f) output[next++] = v;
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
 }
 ```
 
-> 分块双遍扫描
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-每块 256 个线程负责 1,024 个元素。第一遍用线程束投票指令 `__ballot_sync`（32 个线程同时判断 `v > 0` 并拼成一个 32 位掩码）配合 `__popc`（统计二进制中 `1` 的个数）算出每块的正数总数；中间对块计数做两级排他前缀和；第二遍重读输入，在每个线程（lane）上用位掩码算出前面线程的正数个数，直接定位写入地址：
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
+
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
+
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
 
 ```cuda
-const unsigned lower_lanes = (1u << lane) - 1u;
-if (values[row] > 0.0f) {
-    output[base + __popc(masks[row] & lower_lanes)] = values[row];
-}
-base += __popc(masks[row]);
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
 ```
 
-1.48 ms 66.7th percentile (A100)
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
 
-> 向量化双遍 + 共享内存连续写回
-
-双遍标量版的主要瓶颈有两处：按单个 `float` 读取没有跑满显存带宽，且第二遍过滤后幸存的正数直接零散写往全局内存，写合并效率低。优化版做了三点改进：
-
-- **16 字节对齐 `float4` 读取**：先把开头零散的 1~3 个元素单独处理，主体部分每条指令一次读入 4 个浮点数，指令数减为原来的四分之一。
-- **共享内存（shared memory）中转写回**：第二遍先把本块挑出的所有正数在片上共享内存 `s_out` 里排成连续数组，再由全块线程以 `float4` 向量化连续写回全局显存，把离散写变成满带宽合并写。
-- **静态设备缓冲区**：预分配静态设备数组存放块偏移，一亿元素以内省去运行时动态分配（`cudaMallocAsync`）开销。
-
-0.36 ms 96.5th percentile (A100)
-
-这一版把显存读写双端都换成了 128 位向量化连续事务，在 A100 上耗时从 1.48 ms 降到 **0.36 ms**（提速 4.1 倍）。仓库中同时保留了一份[单遍解耦回看（Decoupled Look-back）实现](./solutions/reduction/stream-compaction-lookback.cu)供对比：它在容量受限的 T4 上更快（5,000 万元素耗时从 1.69 ms 降到 1.04 ms），在带宽充裕的 A100 上则以向量化合并写回版（0.36 ms vs 1.66 ms）表现最优。
-
-完整代码：[单线程基线](./solutions/reduction/stream-compaction-baseline.cu) · [双遍分块扫描](./solutions/reduction/stream-compaction.cu) · [单遍回看](./solutions/reduction/stream-compaction-lookback.cu) · [向量化双遍扫描](./solutions/reduction/stream-compaction-vectorized.cu)
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
