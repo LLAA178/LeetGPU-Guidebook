@@ -9,6 +9,10 @@
 - [章节笔记](docs/cuda-best-practices/README.md)
 - [实验文档](docs/cuda-best-practices/experiments/README.md)
 
+## 逐题独立题解
+
+新增题目的独立中文题解统一存放在 [`docs/challenges/`](docs/challenges/) 目录下（每题一个文件，避免多 PR 并行合并冲突）；已合入本页的旧题保持原位置不变。
+
 ## 索引
 
 | 简单题 | 中等题 | 困难题 |
