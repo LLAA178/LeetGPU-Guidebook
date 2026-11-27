@@ -2018,6 +2018,10 @@ A = [[2, 0, 0, 1],     B = [[1, 2],     C = [[2*1 + 1*7, 2*2 + 1*8],  = [[ 9, 12
 - 优化实现 v1（纯 `__ballot_sync` 跳零 + 共享内存 `B`）：`2.8005 ms`（等效 3067.2 GFLOP/s，相对基础版加速 **5.85×**）
 - 优化实现 v2（`spmm_opt.cu`，双缓冲 `128 × 128 / 8 × 8` 分块 + 极稀疏跳零回退，0 spill）：`1.5399 ms`（等效 **5578.3 GFLOP/s**，相对基础版加速 **10.64×**，相对 v1 再提速 **1.82×**）
 
+**LeetGPU 平台实测（T4）**：
+- v1（`__ballot_sync` 跳零 + 共享内存 `B`）：`4.85 ms`，第 78.3 百分位
+- v2（双缓冲 `128 × 128 / 8 × 8` 分块 + 极稀疏跳零回退）：`3.98 ms`，**第 95.7 百分位**（较 v1 缩短 17.9%）
+
 完整代码：
 - 基础实现：[`solutions/matmul/spmm_baseline.cu`](./solutions/matmul/spmm_baseline.cu)
 - 优化实现：[`solutions/matmul/spmm_opt.cu`](./solutions/matmul/spmm_opt.cu)
