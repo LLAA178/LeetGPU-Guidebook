@@ -4,9 +4,9 @@
 
 namespace {
 
-constexpr int kBr = 8;
+constexpr int kBr = 32;
 constexpr int kBc = 32;
-constexpr int kThreads = 128;  // 8x16: ty in [0..7] (1 Q row), tx in [0..15] (2 K cols / float4 O cols)
+constexpr int kThreads = 128;  // 8x16: ty in [0..7] (4 Q rows/thread), tx in [0..15] (2 K cols / float4 O cols)
 
 __device__ __forceinline__ float subwarp16_max(float val) {
     val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
@@ -24,9 +24,13 @@ __device__ __forceinline__ float subwarp16_sum(float val) {
     return val;
 }
 
+// High-reuse 8x16 (128-thread) float4-vectorized FlashAttention (Br=32, Bc=32):
+// - Each thread owns 4 Q rows -> 4x register reuse of every K/V float4 loaded from smem.
+// - Reverse block scheduling launches heaviest causal blocks first to eliminate tail imbalance.
+// - Interior tiles (k_start + Bc - 1 <= q_block_row) run branch-free without causal mask checks.
 template <int kVecCols>
-__global__ void __launch_bounds__(128, 2)
-causal_self_attention_8x16_kernel(const float* __restrict__ Q,
+__global__ void __launch_bounds__(128, 1)
+causal_self_attention_br32_kernel(const float* __restrict__ Q,
                                   const float* __restrict__ K,
                                   const float* __restrict__ V,
                                   float* __restrict__ output,
@@ -37,37 +41,46 @@ causal_self_attention_8x16_kernel(const float* __restrict__ Q,
     const int d_stride = d + 4;
     float* sQ = smem;
     float* sKV = sQ + kBr * d_stride;
-    float* sP = sKV + kBc * d_stride;  // 8 * 36
+    float* sP = sKV + kBc * d_stride;  // 32 * 36
 
     const int tid = threadIdx.x;
-    const int ty = tid >> 4;  // 0..7  -> 1 Q row
+    const int ty = tid >> 4;  // 0..7  -> 4 Q rows (ty*4 .. ty*4+3)
     const int tx = tid & 15;  // 0..15 -> 2 K cols / float4 O chunks
-    const int q_block_row = blockIdx.x * kBr;
+
+    // Reverse block scheduling: heaviest blocks (largest q_block_row) launch first.
+    const int q_block_idx = gridDim.x - 1 - blockIdx.x;
+    const int q_block_row = q_block_idx * kBr;
     const int q_len = min(kBr, M - q_block_row);
-    const int q_row_global = q_block_row + ty;
     const int q_max_row = q_block_row + q_len - 1;
     const int vec_d = d >> 2;
 
     for (int idx = tid; idx < q_len * vec_d; idx += kThreads) {
         const int r = idx / vec_d;
         const int c4 = idx % vec_d;
-        float4 v = *reinterpret_cast<const float4*>(&Q[static_cast<size_t>(q_block_row + r) * d + c4 * 4]);
+        float4 v = *reinterpret_cast<const float4*>(
+            &Q[static_cast<size_t>(q_block_row + r) * d + c4 * 4]);
         *reinterpret_cast<float4*>(&sQ[r * d_stride + c4 * 4]) =
             make_float4(v.x * scale, v.y * scale, v.z * scale, v.w * scale);
     }
     __syncthreads();
 
-    float4 o_reg[kVecCols];
+    float4 o_reg[4][kVecCols];
+    float m[4];
+    float l[4];
     #pragma unroll
-    for (int c = 0; c < kVecCols; ++c) {
-        o_reg[c] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int i = 0; i < 4; ++i) {
+        m[i] = -FLT_MAX;
+        l[i] = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < kVecCols; ++c) {
+            o_reg[i][c] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
     }
 
-    float m = -FLT_MAX;
-    float l = 0.0f;
-    const bool valid_q = (ty < q_len);
+    const int r_base = ty * 4;
+    const int k0 = tx * 2;
+    const int k1 = k0 + 1;
 
-    // Causal early-exit: skip all K/V tiles strictly past the last query row in this block.
     for (int k_start = 0; k_start <= q_max_row; k_start += kBc) {
         const int kv_len = min(kBc, M - k_start);
 
@@ -75,98 +88,160 @@ causal_self_attention_8x16_kernel(const float* __restrict__ Q,
             const int r = idx / vec_d;
             const int c4 = idx % vec_d;
             *reinterpret_cast<float4*>(&sKV[r * d_stride + c4 * 4]) =
-                *reinterpret_cast<const float4*>(&K[static_cast<size_t>(k_start + r) * d + c4 * 4]);
+                *reinterpret_cast<const float4*>(
+                    &K[static_cast<size_t>(k_start + r) * d + c4 * 4]);
         }
         __syncthreads();
 
-        // 1. Q @ K^T (1x2 per thread, float4 vectorized) with causal mask j <= q_row
-        float s0 = 0.0f, s1 = 0.0f;
-        const int k0 = tx * 2;
-        const int k1 = k0 + 1;
-        const bool v0 = valid_q && (k0 < kv_len) && (k_start + k0 <= q_row_global);
-        const bool v1 = valid_q && (k1 < kv_len) && (k_start + k1 <= q_row_global);
-        if (v0 || v1) {
-            const float* q_row = &sQ[ty * d_stride];
+        const bool is_full_tile = (k_start + kBc - 1 <= q_block_row) && (q_len == kBr);
+
+        float s0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float s1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        if (is_full_tile) {
+            // Fast path: interior tile, zero causal mask branches.
             for (int k = 0; k < d; k += 4) {
-                float4 qv = *reinterpret_cast<const float4*>(&q_row[k]);
-                if (v0) {
-                    float4 kv = *reinterpret_cast<const float4*>(&sKV[k0 * d_stride + k]);
-                    s0 = fmaf(qv.x, kv.x, fmaf(qv.y, kv.y, fmaf(qv.z, kv.z, fmaf(qv.w, kv.w, s0))));
+                float4 kv0 = *reinterpret_cast<const float4*>(&sKV[k0 * d_stride + k]);
+                float4 kv1 = *reinterpret_cast<const float4*>(&sKV[k1 * d_stride + k]);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float4 qv = *reinterpret_cast<const float4*>(&sQ[(r_base + i) * d_stride + k]);
+                    s0[i] = fmaf(qv.x, kv0.x, fmaf(qv.y, kv0.y, fmaf(qv.z, kv0.z, fmaf(qv.w, kv0.w, s0[i]))));
+                    s1[i] = fmaf(qv.x, kv1.x, fmaf(qv.y, kv1.y, fmaf(qv.z, kv1.z, fmaf(qv.w, kv1.w, s1[i]))));
                 }
-                if (v1) {
-                    float4 kv = *reinterpret_cast<const float4*>(&sKV[k1 * d_stride + k]);
-                    s1 = fmaf(qv.x, kv.x, fmaf(qv.y, kv.y, fmaf(qv.z, kv.z, fmaf(qv.w, kv.w, s1))));
+            }
+
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float tile_max = subwarp16_max(fmaxf(s0[i], s1[i]));
+                float m_new = fmaxf(m[i], tile_max);
+                float alpha = __expf(m[i] - m_new);
+                float p0 = __expf(s0[i] - m_new);
+                float p1 = __expf(s1[i] - m_new);
+                *reinterpret_cast<float2*>(&sP[(r_base + i) * 36 + k0]) = make_float2(p0, p1);
+                float tile_sum = subwarp16_sum(p0 + p1);
+                l[i] = l[i] * alpha + tile_sum;
+                m[i] = m_new;
+                #pragma unroll
+                for (int c = 0; c < kVecCols; ++c) {
+                    o_reg[i][c].x *= alpha;
+                    o_reg[i][c].y *= alpha;
+                    o_reg[i][c].z *= alpha;
+                    o_reg[i][c].w *= alpha;
+                }
+            }
+        } else {
+            // Diagonal / boundary tile: apply causal mask j <= q_row.
+            const bool k0_in = (k0 < kv_len);
+            const bool k1_in = (k1 < kv_len);
+            for (int k = 0; k < d; k += 4) {
+                float4 kv0 = k0_in ? *reinterpret_cast<const float4*>(&sKV[k0 * d_stride + k])
+                                   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                float4 kv1 = k1_in ? *reinterpret_cast<const float4*>(&sKV[k1 * d_stride + k])
+                                   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    if (r_base + i < q_len) {
+                        float4 qv = *reinterpret_cast<const float4*>(&sQ[(r_base + i) * d_stride + k]);
+                        s0[i] = fmaf(qv.x, kv0.x, fmaf(qv.y, kv0.y, fmaf(qv.z, kv0.z, fmaf(qv.w, kv0.w, s0[i]))));
+                        s1[i] = fmaf(qv.x, kv1.x, fmaf(qv.y, kv1.y, fmaf(qv.z, kv1.z, fmaf(qv.w, kv1.w, s1[i]))));
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int q_row_g = q_block_row + r_base + i;
+                const bool valid_q = (r_base + i < q_len);
+                const bool v0 = valid_q && k0_in && (k_start + k0 <= q_row_g);
+                const bool v1 = valid_q && k1_in && (k_start + k1 <= q_row_g);
+
+                float rmax = -FLT_MAX;
+                if (v0) rmax = fmaxf(rmax, s0[i]);
+                if (v1) rmax = fmaxf(rmax, s1[i]);
+
+                float tile_max = subwarp16_max(rmax);
+                float m_new = fmaxf(m[i], tile_max);
+                float alpha = (m_new > -FLT_MAX) ? __expf(m[i] - m_new) : 1.0f;
+                float p0 = v0 ? __expf(s0[i] - m_new) : 0.0f;
+                float p1 = v1 ? __expf(s1[i] - m_new) : 0.0f;
+
+                *reinterpret_cast<float2*>(&sP[(r_base + i) * 36 + k0]) = make_float2(p0, p1);
+                float tile_sum = subwarp16_sum(p0 + p1);
+                l[i] = l[i] * alpha + tile_sum;
+                m[i] = m_new;
+                #pragma unroll
+                for (int c = 0; c < kVecCols; ++c) {
+                    o_reg[i][c].x *= alpha;
+                    o_reg[i][c].y *= alpha;
+                    o_reg[i][c].z *= alpha;
+                    o_reg[i][c].w *= alpha;
                 }
             }
         }
-
-        // 2. 16-thread sub-warp Online Softmax
-        float rmax = -FLT_MAX;
-        if (v0) rmax = fmaxf(rmax, s0);
-        if (v1) rmax = fmaxf(rmax, s1);
-
-        float tile_max = subwarp16_max(rmax);
-        float m_new = fmaxf(m, tile_max);
-        float alpha = (m_new > -FLT_MAX) ? __expf(m - m_new) : 1.0f;
-
-        float p0 = v0 ? __expf(s0 - m_new) : 0.0f;
-        float p1 = v1 ? __expf(s1 - m_new) : 0.0f;
-
-        *reinterpret_cast<float2*>(&sP[ty * 36 + k0]) = make_float2(p0, p1);
-        float tile_sum = subwarp16_sum(p0 + p1);
-        l = l * alpha + tile_sum;
-        m = m_new;
-
-        #pragma unroll
-        for (int c = 0; c < kVecCols; ++c) {
-            o_reg[c].x *= alpha;
-            o_reg[c].y *= alpha;
-            o_reg[c].z *= alpha;
-            o_reg[c].w *= alpha;
-        }
         __syncthreads();
 
-        // 3. Load V tile into sKV
+        // Load V tile into sKV
         for (int idx = tid; idx < kv_len * vec_d; idx += kThreads) {
             const int r = idx / vec_d;
             const int c4 = idx % vec_d;
             *reinterpret_cast<float4*>(&sKV[r * d_stride + c4 * 4]) =
-                *reinterpret_cast<const float4*>(&V[static_cast<size_t>(k_start + r) * d + c4 * 4]);
+                *reinterpret_cast<const float4*>(
+                    &V[static_cast<size_t>(k_start + r) * d + c4 * 4]);
         }
         __syncthreads();
 
-        // 4. float4-vectorized P @ V (skipping masked tail j > q_row_global)
-        if (valid_q) {
-            const float* p_row = &sP[ty * 36];
-            const int j_end = min(kv_len, q_row_global - k_start + 1);
-            for (int j = 0; j < j_end; ++j) {
-                float p = p_row[j];
-                const float* v_row = &sKV[j * d_stride];
-                #pragma unroll
-                for (int c = 0; c < kVecCols; ++c) {
-                    const int col = tx * 4 + c * 64;
-                    if (col < d) {
-                        float4 vv = *reinterpret_cast<const float4*>(&v_row[col]);
-                        o_reg[c].x = fmaf(p, vv.x, o_reg[c].x);
-                        o_reg[c].y = fmaf(p, vv.y, o_reg[c].y);
-                        o_reg[c].z = fmaf(p, vv.z, o_reg[c].z);
-                        o_reg[c].w = fmaf(p, vv.w, o_reg[c].w);
-                    }
+        // P @ V: 4x register reuse of every V float4 across 4 Q rows
+        #pragma unroll 4
+        for (int j = 0; j < kv_len; ++j) {
+            const float p0 = sP[(r_base + 0) * 36 + j];
+            const float p1 = sP[(r_base + 1) * 36 + j];
+            const float p2 = sP[(r_base + 2) * 36 + j];
+            const float p3 = sP[(r_base + 3) * 36 + j];
+            const float* v_row = &sKV[j * d_stride];
+            #pragma unroll
+            for (int c = 0; c < kVecCols; ++c) {
+                const int col = tx * 4 + c * 64;
+                if (col < d) {
+                    float4 vv = *reinterpret_cast<const float4*>(&v_row[col]);
+                    o_reg[0][c].x = fmaf(p0, vv.x, o_reg[0][c].x);
+                    o_reg[0][c].y = fmaf(p0, vv.y, o_reg[0][c].y);
+                    o_reg[0][c].z = fmaf(p0, vv.z, o_reg[0][c].z);
+                    o_reg[0][c].w = fmaf(p0, vv.w, o_reg[0][c].w);
+
+                    o_reg[1][c].x = fmaf(p1, vv.x, o_reg[1][c].x);
+                    o_reg[1][c].y = fmaf(p1, vv.y, o_reg[1][c].y);
+                    o_reg[1][c].z = fmaf(p1, vv.z, o_reg[1][c].z);
+                    o_reg[1][c].w = fmaf(p1, vv.w, o_reg[1][c].w);
+
+                    o_reg[2][c].x = fmaf(p2, vv.x, o_reg[2][c].x);
+                    o_reg[2][c].y = fmaf(p2, vv.y, o_reg[2][c].y);
+                    o_reg[2][c].z = fmaf(p2, vv.z, o_reg[2][c].z);
+                    o_reg[2][c].w = fmaf(p2, vv.w, o_reg[2][c].w);
+
+                    o_reg[3][c].x = fmaf(p3, vv.x, o_reg[3][c].x);
+                    o_reg[3][c].y = fmaf(p3, vv.y, o_reg[3][c].y);
+                    o_reg[3][c].z = fmaf(p3, vv.z, o_reg[3][c].z);
+                    o_reg[3][c].w = fmaf(p3, vv.w, o_reg[3][c].w);
                 }
             }
         }
         __syncthreads();
     }
 
-    if (valid_q) {
-        float* o_ptr = output + static_cast<size_t>(q_row_global) * d;
-        const float inv_l = 1.0f / l;
-        #pragma unroll
-        for (int c = 0; c < kVecCols; ++c) {
-            const int col = tx * 4 + c * 64;
-            if (col < d) {
-                *reinterpret_cast<float4*>(&o_ptr[col]) = make_float4(
-                    o_reg[c].x * inv_l, o_reg[c].y * inv_l, o_reg[c].z * inv_l, o_reg[c].w * inv_l);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if (r_base + i < q_len) {
+            float* o_ptr = output + static_cast<size_t>(q_block_row + r_base + i) * d;
+            const float inv_l = 1.0f / l[i];
+            #pragma unroll
+            for (int c = 0; c < kVecCols; ++c) {
+                const int col = tx * 4 + c * 64;
+                if (col < d) {
+                    *reinterpret_cast<float4*>(&o_ptr[col]) = make_float4(
+                        o_reg[i][c].x * inv_l, o_reg[i][c].y * inv_l,
+                        o_reg[i][c].z * inv_l, o_reg[i][c].w * inv_l);
+                }
             }
         }
     }
@@ -240,9 +315,9 @@ extern "C" void solve(const float* Q, const float* K, const float* V, float* out
         const size_t smem_bytes =
             (static_cast<size_t>(kBr + kBc) * d_stride + kBr * 36ULL) * sizeof(float);
         if (d <= 64) {
-            causal_self_attention_8x16_kernel<1><<<grid, block, smem_bytes>>>(Q, K, V, output, M, d, scale);
+            causal_self_attention_br32_kernel<1><<<grid, block, smem_bytes>>>(Q, K, V, output, M, d, scale);
         } else {
-            causal_self_attention_8x16_kernel<2><<<grid, block, smem_bytes>>>(Q, K, V, output, M, d, scale);
+            causal_self_attention_br32_kernel<2><<<grid, block, smem_bytes>>>(Q, K, V, output, M, d, scale);
         }
         return;
     }

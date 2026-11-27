@@ -2254,22 +2254,25 @@ for (int k_row = 0; k_row <= q_row; ++k_row) {
 
 > optimized
 
-baseline 里每个 warp 每次只算一行 `Q`，`K` 和 `V` 都要反复从 global memory（全局显存）读；优化版改用 FlashAttention 分块思路：一个 128 线程的 block（线程块，组织成 `8×16`）一次处理 `Br=8` 行 `Q`，每次把 `Bc=32` 行 `K` 或 `V` 搬进 shared memory（片上共享内存，速度远快于全局显存）复用，并用 `float4`（一次读写 4 个 `float` 的 128 位向量指令）加速访存。同时利用因果掩码做了两处剪枝：外层分块循环在 `k_start > q_max_row` 时直接提前结束，整块跳过上三角的无效 `K/V` 搬运与计算；内层 `P @ V` 也只遍历到 `j <= q_row`，省掉乘 0 的尾部循环。
+baseline 里每个 warp 每次只算一行 `Q`，`K` 和 `V` 都要反复从 global memory（全局显存）读；优化版改用 FlashAttention 分块思路：一个 128 线程的 block（线程块，组织成 `8×16`）一次处理 `Br=32` 行 `Q`，每个线程同时维护 4 行 `Q` 的累加器，每次把 `Bc=32` 行 `K` 或 `V` 搬进 shared memory（片上共享内存，速度远快于全局显存）复用，并用 `float4`（一次读写 4 个 `float` 的 128 位向量指令）加速访存。同时利用因果掩码做了三处优化：
+- **外层分块提前终止**：当 `k_start > q_max_row` 时直接结束循环，整块跳过上三角的无效 `K/V` 搬运与计算。
+- **内部完整分块无分支路径**：当 `k_start + Bc - 1 <= q_block_row` 时，整个分块全部位于下三角，去掉内层逐元素掩码判断。
+- **逆序 block 调度**：从最大的查询行分块开始发射，让计算量最重的 block 先跑，消除尾部波次的负载不均衡。
 
 ```CUDA
-// 外层按 K/V 分块遍历，超过当前 block 最大查询行后直接提前结束
+const int q_block_idx = gridDim.x - 1 - blockIdx.x;  // 逆序调度，重负载 block 先跑
 for (int k_start = 0; k_start <= q_max_row; k_start += kBc) {
-    // 1. float4 协作加载 K 分块到 shared memory，计算 8x32 局部点积并施加 j <= q_row 掩码
-    // 2. 16 线程子束内用 shuffle 归约完成 Online Softmax，写回 sP
-    // 3. float4 协作加载 V 分块到 shared memory
-    // 4. float4 向量化累加 P @ V，只循环到 j_end = min(kv_len, q_row_global - k_start + 1)
+    // 1. float4 协作加载 K 分块到 shared memory
+    // 2. 内部完整分块走无分支路径，对角分块施加 j <= q_row 掩码；每份 K float4 复用 4 行 Q
+    // 3. 16 线程子束内用 shuffle 归约完成 Online Softmax，写回 sP
+    // 4. float4 协作加载 V 分块到 shared memory，每份 V float4 复用 4 行 Q 累加到寄存器
 }
 ```
 
 > 省了哪一步与实测效果
-- **减少全局显存重复读取**：`8` 行 `Q` 共享同一份片上 `K/V` 分块，配合 `float4` 向量化读写，显著降低显存带宽压力。
-- **因果提前终止**：按块跳过所有 `k_start > q_max_row` 的上三角分块，整体访存和计算量直接减半。
-- **本地实测**：在 `M=5000, d=64` 上，优化版从 `15.323 ms` 降到 `3.684 ms`（提速 `4.16x`）；在 `M=5000, d=128` 上，从 `22.766 ms` 降到 `7.165 ms`（提速 `3.18x`），数值误差均小于 `5e-7`。
+- **4 倍片上数据复用**：每个线程同时算 4 行 `Q`，每次从共享内存读出的 `K/V` `float4` 都直接复用 4 次，大幅缓解片上访存瓶颈。
+- **因果剪枝与负载均衡**：按块跳过上三角分块、内部块去分支、逆序发射重负载 block，减少无效计算与尾部等待。
+- **本地实测**：在 `M=5000, d=64` 上，优化版从 `15.323 ms` 降到 `1.657 ms`（提速 `9.25x`）；在 `M=5000, d=128` 上，从 `22.766 ms` 降到 `3.395 ms`（提速 `6.71x`），数值误差均小于 `5e-7`。
 
 完整代码：
 - baseline：[`solutions/transformer/causal_self_attention_baseline.cu`](./solutions/transformer/causal_self_attention_baseline.cu)
