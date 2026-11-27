@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [prefix-sum](#prefix-sum) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,49 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [prefix-sum](https://leetgpu.com/challenges/prefix-sum)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-计算一维 `float32` 数组的包含前缀和（inclusive prefix sum），满足 `output[i] = input[0] + ... + input[i]`。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-举个例子：输入 `[3, 1, 4, 1, 5, 9]`，如果每 3 个数分一块：
-1. **块内前缀和**：第 0 块算出 `[3, 4, 8]`（块总和为 `8`），第 1 块算出 `[1, 6, 15]`（块总和为 `15`）。
-2. **传播前驱块总和**：第 1 块的每个结果加上前面第 0 块的总和 `8`，得到 `[9, 14, 23]`，拼起来就是最终结果 `[3, 4, 8, 9, 14, 23]`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline：多块分层扫描
+> baseline：按级启动的多遍全局蝶形变换
 
-最直观的并行写法分三步启动 kernel：
-1. 每块 256 个线程先用寄存器洗牌指令 `__shfl_up_sync`（同一线程束内直接读取低编号线程的寄存器值）算出 32 线程局部前缀和，再经共享内存汇总 8 个线程束，写出块内前缀和并把块总和存入临时数组。
-2. 对块总和数组递归做排他前缀和，得到每块的累加起点。
-3. 启动加法 kernel，把每块的起点加回 `output`。
-
-这种三步写法在第一遍写出 `output` 后，第三遍还要再把它从全局显存读回来加偏移并重写一次，整条数组一共发生 `3N` 次全局读写。
-
-> optimized：单遍解耦回看（Decoupled Look-back）
-
-要想把全局显存访问压到理论下限（只读一次 `input`、只写一次 `output`）并且只启动**一个 kernel**，可以让每个线程块把算好的块内前缀留在寄存器里，直接通过全局状态表向前回看前驱块的累加结果（Decoupled Look-back，解耦回看）：
-
-- **块内 `float4` 向量化扫描**：每块 256 个线程处理 4,096 个元素。每个线程用 `float4` 一次读入 4 个连续浮点数，先在寄存器里算出这 4 个数的局部和，再做线程束洗牌和块内汇总，全程驻留寄存器。
-- **状态字单步回看**：每个块准备一个 64 位状态字，打包存放状态标记和浮点数结果：
-  - 状态 `1`（局部总和）：本块刚算完自己的块总和，例如第 1 块发布 `(局部总和, 15)`；
-  - 状态 `2`（完整前缀）：本块已经拿到从第 0 块算起的总前缀，例如第 0 块天然已知完整前缀，直接发布 `(完整前缀, 8)`。
-  - 后续块（比如第 2 块）由第一个线程束的 32 个线程并行往前看：一旦看到第 1 块是 `(局部总和, 15)`、第 0 块是 `(完整前缀, 8)`，在遇到第一个“完整前缀”处立刻停下，把 `8 + 15 = 23` 加起来就是自己的块起点，随即把自己的完整前缀也发布出去，最后将寄存器里的结果一次性以 `float4` 写回全局显存。
-- **纪元号（epoch）免清零复用**：把递增的调用轮次号（epoch）编入状态标记，配合单个 64 位原子计数器动态分配块编号并在最后一块自动递增轮次号，省去了每次调用时的临时显存分配（`cudaMallocAsync`）和状态清零 kernel。
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-// 64 位单字同时读取 (轮次+状态) 与浮点累加和，遇到最近一个完整前缀立即停止回看
-const bool is_pfx = (st.tag == epoch_pfx);
-const bool is_ready = is_pfx || (st.tag == epoch_agg);
-pfx_mask = __ballot_sync(kFull, is_pfx);
-const int stop = __ffs(pfx_mask);
-needed = (stop > 0 && stop < 32) ? ((1u << stop) - 1u) : kFull;
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
+}
 ```
 
-0.04 ms 99.3th percentile (T4)
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-省掉了多遍读写、动态显存分配和额外 kernel 启动开销后，在本地 Tesla T4 上实测官方计时规模 `N = 250,000`（15 轮中位数）：分层扫描基线耗时 504.58 µs，双遍向量化版降至 15.04 µs，单遍解耦回看版进一步降至 **12.03 µs**；在 `N = 50,000,000` 大规模下也从 3.334 ms 降至 **1.417 ms**（提速 2.35 倍）。LeetGPU 官方 T4 提交一次通过，耗时 **0.04 ms（第 99.3 百分位）**。
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-完整代码：[分层扫描基线](./solutions/reduction/prefix-sum-baseline.cu) · [向量化双遍扫描](./solutions/reduction/prefix-sum-twopass.cu) · [单遍解耦回看](./solutions/reduction/prefix-sum-lookback.cu)
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
+
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
+
+```cuda
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
+```
+
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
+
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
