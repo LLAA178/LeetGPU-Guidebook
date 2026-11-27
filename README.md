@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [layer-normalization](#layer-normalization) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,41 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [layer-normalization](https://leetgpu.com/challenges/layer-normalization)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
 *环境: CUDA*
 
-对形状为 `[N, C]` 的二维矩阵按行独立做层归一化（Layer Normalization）：求每一行的均值 `mean` 与有偏方差 `var`，输出 `weight[j] * (input[i, j] - mean_i) / sqrt(var_i + eps) + bias[j]`。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-用一行 4 个数的例子走一遍：`input = [1.0, 2.0, 3.0, 4.0]`，`weight = [1, 1, 1, 1]`，`bias = [0, 0, 0, 0]`，`eps = 1e-5`：
-1. **求行均值**：`(1 + 2 + 3 + 4) / 4 = 2.5`。
-2. **求行方差**：各元素减去均值得到 `[-1.5, -0.5, 0.5, 1.5]`，平方平均得到 `var = (2.25 + 0.25 + 0.25 + 2.25) / 4 = 1.25`，标准差倒数 `inv_std = 1 / sqrt(1.25 + 1e-5) ≈ 0.89442`。
-3. **缩放与平移**：差值乘上 `inv_std` 并应用 `weight` 与 `bias`，得到 `[-1.3416, -0.4472, 0.4472, 1.3416]`。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-> baseline：单块逐行三遍扫描
+> baseline：按级启动的多遍全局蝶形变换
 
-直观写法让 1 个线程块（256 个线程）处理 1 行：第一遍读入求均值，第二遍读入求 `(x - mean)^2` 的方差，第三遍读入完成归一化写回。当 `N = 65,536, C = 512`（输入与输出各占 `128 MiB`）时，整张输入表远超二级缓存（L2 cache）容量，三遍扫描伴随重复显存读取与 `65,536 × 2` 次块内共享内存同步（`__syncthreads`）。
-
-> optimized：单线程束管一行 + `float4` 寄存器常驻单遍归一化
-
-官方计时形状 `N = 65,536, C = 512` 的行宽非常紧凑，一行只有 `512` 个浮点数（`2 KiB`）。与其派一整个 256 线程块去分一行，不如直接让 **1 个线程束（warp，32 个锁步执行的线程）独立包揽 1 行**，一个线程块同时并发处理 4~8 行：
-
-- **寄存器常驻省掉重读**：每个线程束的 32 个线程用 `float4`（单条 128 位指令读 4 个连续浮点数）各加载 4 次，刚好把整行 `32 × 16 = 512` 个浮点数全部装进寄存器 `x0..x3`。整道算子对 `input` 只读一遍、对 `output` 只写一遍，总显存流量压到理论下限 `256 MiB`。
-- **蝶形洗牌省掉共享内存同步**：求均值和求方差都在同一个 32 线程束内部完成，使用 5 步异或洗牌指令 `__shfl_xor_sync`（线程间直接交换寄存器值并使全部 32 个线程同时拿到总和），全程零共享内存占用、零 `__syncthreads()` 等待；拿到均值后直接在寄存器里原地减去均值再求平方和，既省显存又避免大均值相减的精度损失。
-- **全范围自适应分派**：`C <= 512` 走单线程束寄存器模板，`512 < C <= 4,096` 切到 256 线程单块寄存器常驻模板，非 16 字节对齐或非 4 倍数行宽自动走片上共享内存单遍缓存路径，覆盖 `1 <= C <= 4,096` 全部边界。
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
 ```cuda
-// 32 线程束将 512 个元素装入 x0..x3 寄存器，两次 5 步寄存器洗牌即可原地完成归一化
-const float mean = warp_allreduce_sum(sum) * (1.0f / 512.0f);
-x0.x -= mean; x0.y -= mean; x0.z -= mean; x0.w -= mean;
-// ... 对 x1..x3 同样原地减去 mean 后累加平方和 var_sum
-const float inv_std = rsqrtf(warp_allreduce_sum(var_sum) * (1.0f / 512.0f) + eps);
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
+}
 ```
 
-1.17 ms 91.4th percentile (T4)
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-本地 Tesla T4（CUDA 12.4）每次刷空 L2 缓存，在官方计时规模 `N = 65,536, C = 512` 下取 15 轮中位数：基线耗时 `1.0550 ms`，单线程束寄存器常驻版降至 **`0.9483 ms`**（单遍有效带宽达 `283.1 GB/s`），并通过 23 组多尺寸、大均值偏移数值稳定性与非对齐边界测试。LeetGPU 官方 Tesla T4 首次提交即通过全部测试，耗时 **`1.17 ms`（第 `91.4` 百分位）**。
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-完整代码：[单块三遍基线](./solutions/normalization/layer-normalization-baseline.cu) · [单线程束寄存器常驻优化](./solutions/normalization/layer-normalization-opt.cu)
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
+
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
+
+```cuda
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
+```
+
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
+
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
