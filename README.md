@@ -22,7 +22,7 @@
 | [relu](#relu) | [rotary-positional-embedding](#rotary-positional-embedding) |  |
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
-| [matrix-copy](#matrix-copy) |  |  |
+| [matrix-copy](#matrix-copy) | [sparse-matrix-dense-matrix-multiplication](#sparse-matrix-dense-matrix-multiplication) |  |
 | [count-array-element](#count-array-element) |  |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
@@ -1993,6 +1993,33 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 这题和普通逐元素 kernel 的差别在于：优化目标不是少做乘法，而是把“同一个 tile 共用同一个 scale”这件事吃干净。
 
 完整代码：[`solutions/quantization/weight-dequantization.cu`](./solutions/quantization/weight-dequantization.cu)
+
+### [sparse-matrix-dense-matrix-multiplication](https://leetgpu.com/challenges/sparse-matrix-dense-matrix-multiplication)
+
+**一句话说明要算什么**：给定一个大约 60%–70% 元素为 0 的稀疏矩阵 `A`（大小 `M × N`，按行主序存储的 FP32 数组）和一个稠密矩阵 `B`（大小 `N × K`），求它们的矩阵乘积 `C = A × B`（大小 `M × K`）。
+
+**小例子**：设 `A` 为 `3 × 4`、`B` 为 `4 × 2`：
+
+```text
+A = [[2, 0, 0, 1],     B = [[1, 2],     C = [[2*1 + 1*7, 2*2 + 1*8],  = [[ 9, 12],
+     [0, 3, 0, 0],          [3, 4],          [3*3,       3*4      ],     [ 9, 12],
+     [0, 0, 4, 0]]          [5, 6],          [4*5,       4*6      ]]     [20, 24]]
+                            [7, 8]]
+```
+
+第 0 行只需要用到 `B` 的第 0 行和第 3 行，中间两个 0 对应的乘法和访存都可以跳过。
+
+**省了哪一步**：
+1. **省掉 65% 的无效访存与乘加**：基础版让每个线程独立算一个 `C[row, col]`，虽然能跳过 `A[row, k] == 0`，但同一个 `B` 元素会被不同行反复从全局显存读取，而且相邻线程走不同分支容易产生分支发散。优化版让整个 **warp**（线程束，32 个同步执行的线程）共同处理 `A` 的同一行，先协作读入连续 32 个 `A` 元素，再用 **`__ballot_sync`**（线程束内投票掩码）把非零位置压成一个 32 位整数，只遍历为 1 的位，全线程束零分支发散地跳过所有 0。
+2. **把 `B` 的热数据留在片上复用**：每个线程块包含 8 个 warp，共处理 `BM = 32` 行 `A` 和 `BN = 256` 列 `B`。在每个 `BK = 32` 的步长内，线程块先用 **`float4`**（128 位向量化读写，一次读写 4 个 float）把 `32 × 256` 的 `B` 分块搬进 **shared memory**（共享内存，片上高速缓存），让这 32 行 `A` 共享同一份 `B` 分块，把 `B` 的全局显存读取次数降低 32 倍；同时每个非零 `A` 值通过 `__shfl_sync`（线程束内寄存器广播）分发给全部 32 个线程，每个线程一次完成 8 次乘加（2 个 `float4`），大幅摊薄循环控制开销。
+
+**本地实测**（官方 benchmark 规模 `M = 4096, N = 2048, K = 512`，稀疏度 65%，`nnz = 2,937,616`，与 FP64 CPU 参考结果对拍全部通过，`max_abs = 6.725e-5`）：
+- 基础实现（`spmm_baseline.cu`）：`16.3890 ms`（等效 524.1 GFLOP/s）
+- 优化实现（`spmm_opt.cu`，0 bytes register spill）：`2.8005 ms`（等效 3067.2 GFLOP/s，相对基础版加速 **5.85×**）
+
+完整代码：
+- 基础实现：[`solutions/matmul/spmm_baseline.cu`](./solutions/matmul/spmm_baseline.cu)
+- 优化实现：[`solutions/matmul/spmm_opt.cu`](./solutions/matmul/spmm_opt.cu)
 
 ## 困难题
 
