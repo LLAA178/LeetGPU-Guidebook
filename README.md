@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [sparse-matrix-dense-matrix-multiplication](#sparse-matrix-dense-matrix-multiplication) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,37 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [sparse-matrix-dense-matrix-multiplication](https://leetgpu.com/challenges/sparse-matrix-dense-matrix-multiplication)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
+*环境: CUDA*
 
-**一句话说明要算什么**：给定一个大约 60%–70% 元素为 0 的稀疏矩阵 `A`（大小 `M × N`，按行主序存储的 FP32 数组）和一个稠密矩阵 `B`（大小 `N × K`），求它们的矩阵乘积 `C = A × B`（大小 `M × K`）。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-**小例子**：设 `A` 为 `3 × 4`、`B` 为 `4 × 2`：
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-```text
-A = [[2, 0, 0, 1],     B = [[1, 2],     C = [[2*1 + 1*7, 2*2 + 1*8],  = [[ 9, 12],
-     [0, 3, 0, 0],          [3, 4],          [3*3,       3*4      ],     [ 9, 12],
-     [0, 0, 4, 0]]          [5, 6],          [4*5,       4*6      ]]     [20, 24]]
-                            [7, 8]]
+> baseline：按级启动的多遍全局蝶形变换
+
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
+
+```cuda
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
+
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
+}
 ```
 
-第 0 行只需要用到 `B` 的第 0 行和第 3 行，中间两个 0 对应的乘法和访存都可以跳过。
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
 
-**省了哪一步**：
-1. **按稀疏度自动分流**：题目中 `A` 的稀疏度大约是 60%–70%（即 30%–40% 的元素非零），这属于“中等稀疏”。如果硬按逐行跳零去做，线程束需要反复执行投票掩码与位扫描控制指令，并且每个 `B` 分块只能被少量行复用；当稀疏度极高（非零比例低于 10%）或尺寸未按 128 对齐时，才走 **warp**（线程束，32 个同步执行的线程）级 **`__ballot_sync`**（线程束内投票掩码）跳零路径，全线程束零分支发散地跳过所有 0。
-2. **双缓冲 `128 × 128` 分块与 `8 × 8` 寄存器复用**：在中等稀疏的主路径上，每个线程块用 256 个线程负责输出矩阵 `C` 的 `128 × 128` 分块，每个线程在寄存器里维护 `8 × 8` 个累加器，把 `B` 的复用率提升到 128 倍。内层归约维度按步长 8 推进，用 **`float4`**（128 位向量化读写，一次读写 4 个 float）把下一块的 `A` 和 `B` 预取到 **shared memory**（共享内存，片上高速缓存）的双缓冲区中，`sA` 转置并按 132 步长填充避免共享内存 bank conflict（存储体冲突），一边算当前块一边预取下一块，隐藏全局显存延迟，编译后 0 字节寄存器溢出（0 spill）。
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
 
-**本地实测**（官方 benchmark 规模 `M = 4096, N = 2048, K = 512`，稀疏度 65%，`nnz = 2,937,616`，与 FP64 CPU 参考结果对拍全部通过，`max_abs = 6.725e-5`）：
-- 基础实现（`spmm_baseline.cu`）：`16.3890 ms`（等效 524.1 GFLOP/s）
-- 优化实现 v1（纯 `__ballot_sync` 跳零 + 共享内存 `B`）：`2.8005 ms`（等效 3067.2 GFLOP/s，相对基础版加速 **5.85×**）
-- 优化实现 v2（`spmm_opt.cu`，双缓冲 `128 × 128 / 8 × 8` 分块 + 极稀疏跳零回退，0 spill）：`1.5399 ms`（等效 **5578.3 GFLOP/s**，相对基础版加速 **10.64×**，相对 v1 再提速 **1.82×**）
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
 
-**LeetGPU 平台实测（T4）**：
-- v1（`__ballot_sync` 跳零 + 共享内存 `B`）：`4.85 ms`，第 78.3 百分位
-- v2（双缓冲 `128 × 128 / 8 × 8` 分块 + 极稀疏跳零回退）：`3.98 ms`，**第 95.7 百分位**（较 v1 缩短 17.9%）
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
 
-完整代码：
-- 基础实现：[`solutions/matmul/spmm_baseline.cu`](./solutions/matmul/spmm_baseline.cu)
-- 优化实现：[`solutions/matmul/spmm_opt.cu`](./solutions/matmul/spmm_opt.cu)
+```cuda
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
+```
+
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
+
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
