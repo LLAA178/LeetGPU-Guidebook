@@ -22,8 +22,8 @@
 | [relu](#relu) | [rotary-positional-embedding](#rotary-positional-embedding) |  |
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
-| [matrix-copy](#matrix-copy) | [grouped-gemm](#grouped-gemm) |  |
-| [count-array-element](#count-array-element) |  |  |
+| [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
+| [count-array-element](#count-array-element) | [grouped-gemm](#grouped-gemm) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -1993,6 +1993,38 @@ __global__ void weight_dequant_tile_vec4_kernel(const float* X, const float* S, 
 这题和普通逐元素 kernel 的差别在于：优化目标不是少做乘法，而是把“同一个 tile 共用同一个 scale”这件事吃干净。
 
 完整代码：[`solutions/quantization/weight-dequantization.cu`](./solutions/quantization/weight-dequantization.cu)
+
+### [general-matrix-multiplication](https://leetgpu.com/challenges/general-matrix-multiplication-gemm)
+*环境: CUDA，Tensor Core 版本需要 SM 7.5 或更高架构*
+
+这题要算半精度浮点（FP16）通用矩阵乘加 `C = alpha * (A × B) + beta * C`。输入和输出矩阵都是 FP16，中间点积用单精度浮点（FP32）累加保证精度，最后转回 FP16 写回。
+
+举个小例子：假设 `M = N = K = 1024`，如果每个线程独立算 `C` 里的 1 个数，每算 1 个输出就要从显存读 2048 个半精度数，算力单元大部分时间都在等数据。
+
+> baseline
+
+每个线程负责 1 个输出元素，沿 `K` 累加 FP32 点积，最后乘以 `alpha` 并加上 `beta * C`（`beta == 0` 时跳过读取原 `C`）。
+
+```CUDA
+float acc = 0.0f;
+for (int k = 0; k < K; ++k) {
+    acc = fmaf(__half2float(a_row[k]), __half2float(B[static_cast<size_t>(k) * N + col]), acc);
+}
+float out = alpha * acc;
+if (beta != 0.0f) out = fmaf(beta, __half2float(C[c_idx]), out);
+C[c_idx] = __float2half(out);
+```
+
+> tensor core
+
+为了把 T4 的矩阵计算单元（Tensor Core）跑满，优化版对整除且对齐的形状做了三步加速（其余边界形状自动走标量版）：
+- **分块与双缓冲预取**：一个线程块（4 个线程束、128 线程）负责 `64×64` 的输出块，沿 `K` 每次推进 32。线程用 `uint4`（一次 16 字节、8 个 FP16）把 `A/B` 搬进共享内存（片上高速缓存），在计算当前块的同时把下一块提前读进寄存器，把访存延迟藏在计算后面。
+- **`ldmatrix.x4` 批量加载**：共享内存每行多留 8 个 FP16 的空位（padding）避免存储体冲突（bank conflict）；每个 `k = 8` 子步只需 2 条 `ldmatrix.x4`（片上矩阵加载指令），就能把 2 块 `A` 和 4 块 `B` 一次喂给 `mma.sync` 矩阵乘加指令。
+- **`half2` 直接写回**：按 `m16n8k8` 的输出布局，每个线程正好握着相邻两个元素，算完 `alpha/beta` 后直接用 `half2` 写回 `C`，省掉共享内存中转，`beta == 0` 时也不读原 `C`。
+
+优化版在 LeetGPU 官方 T4 上通过全部测试，耗时 **0.29 ms**（第 **95.6** 百分位）；本地 T4 对照测试中，基线版 `1024×1024×1024` 耗时 `3.74 ms`，优化版降至 `0.105 ms`（快了 35 倍）。
+
+完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
 ### [grouped-gemm](https://leetgpu.com/challenges/grouped-gemm)
 
