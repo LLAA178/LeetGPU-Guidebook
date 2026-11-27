@@ -23,7 +23,7 @@
 | [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
 | [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
 | [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [grouped-gemm](#grouped-gemm) |  |
+| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
 | [count-2d-array-element](#count-2d-array-element) |  |  |
 | [value-clipping](#value-clipping) |  |  |
 
@@ -2026,25 +2026,65 @@ C[c_idx] = __float2half(out);
 
 完整代码：[标量基线版](solutions/matmul/general_matrix_multiplication_baseline.cu) · [双缓冲 MMA 优化版](solutions/matmul/general_matrix_multiplication_mma.cu)
 
-### [grouped-gemm](https://leetgpu.com/challenges/grouped-gemm)
+### [hadamard-transform](https://leetgpu.com/challenges/hadamard-transform)
+*环境: CUDA*
 
-这题要算的是**分组矩阵乘法（Grouped GEMM）**：把总行数 `M_total` 的输入矩阵 `A` 按 `group_offsets` 切成 `G` 段连续行，每段 `A[s:e]` 分别乘以自己对应的权重矩阵 `B[g]`（形状 `K × N`），写回输出 `C[s:e]`；这是混合专家模型（MoE，Mixture-of-Experts）推理里一次启动算完所有专家投影的核心算子。
+给定形状为 `[B, N]` 的浮点矩阵（`N` 为 2 的幂），对每一行独立计算正交归一化的沃尔什-阿达玛变换（Walsh-Hadamard Transform）：按步长 `h = 1, 2, 4, ..., N/2` 依次对配对位置 `(j, j + h)` 做蝶形加减 `(u + v, u - v)`，全部阶段结束后再统一除以 `sqrt(N)`。
 
-举个小例子：假设 `G = 2, M_total = 4, K = 2, N = 3`，`group_offsets = [0, 2, 4]`。第 0 组占 `A` 的第 `[0, 2)` 行，与 `B[0]` 相乘写入 `C[0:2]`；第 1 组占第 `[2, 4)` 行，与 `B[1]` 相乘写入 `C[2:4]`。如果某组满足 `group_offsets[g] == group_offsets[g+1]`，说明该组为空，跳过不写即可。
+拿官方样例 `input = [1, 2, 3, 4]`（`N = 4`）走一遍两级蝶形加减：
+- 第一级 `h = 1`（相邻配对 `(0,1)` 与 `(2,3)`）：`[1+2, 1-2, 3+4, 3-4] = [3, -1, 7, -1]`；
+- 第二级 `h = 2`（跨距配对 `(0,2)` 与 `(1,3)`）：`[3+7, -1+(-1), 3-7, -1-(-1)] = [10, -2, -4, 0]`；
+- 最后除以 `sqrt(4) = 2`，得到归一化输出 `[5.0, -1.0, -2.0, 0.0]`。
 
-**基础版（Baseline）** 直接按 `(M_total, N)` 启动二维线程网格，每个线程先对 `group_offsets` 做二分查找确定自己属于哪一组 `g`，再沿 `K` 维循环做点积。写法直观，但每个元素都要从显存重复读取整行 `A` 和整列 `B[g]`，带宽浪费严重。
+> baseline：按级启动的多遍全局蝶形变换
 
-**优化版（128×128 双缓冲寄存器分块）** 省掉了两类开销：
-1. **设备端按组划分行块（Tile，分块），省掉主机同步**：因为 `G <= 64`，每个线程块（Block）在核函数开头直接扫描 `group_offsets` 把 `blockIdx.y` 映射到唯一的 `(group_id, local_tile_m)`，保证同一线程块只算同一组的数据，既不需要把 `group_offsets` 拷回 CPU，也不需要为每组单独启动核函数。
-2. **共享内存（Shared Memory）双缓冲 + `float4` 向量化访存 + 每线程 `8×8` 寄存器微块**：每个 `256` 线程的块负责 `128×128` 输出块，沿 `K` 维以 `BK = 8` 推进；在计算当前缓冲块的同时预取下一块到寄存器，把大量重复的显存访问压缩为片上寄存器复用；对 `K % 8 != 0` 或 `N % 4 != 0` 的非对齐形状自动回退到通用 `16×16` 共享内存分块核函数。
+基础版准备一块同尺寸的临时缓冲区，按 `h = 1, 2, ..., N/2` 循环启动 `log2(N)` 次蝶形 kernel，每轮乒乓交换输入输出指针，并在最后一轮顺手乘上 `1 / sqrt(N)`：
 
-在官方性能形状 `G = 8, M_total = 8192, K = 1024, N = 2048`（不均衡分组，FP32）上的实测结果：
-- 本地 GPU 对比：Baseline `74.298 ms`（`462.46 GFLOP/s`）→ Opt `7.635 ms`（`4500.32 GFLOP/s`，加速 **9.73x**，与 Baseline 最大误差 `0.00e+00`）
-- LeetGPU 平台提交（T4）：**13.44 ms，第 90.5 百分位**
+```cuda
+__global__ void hadamard_stage_baseline_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int B, int N, int h, float post_scale) {
+    const size_t pair_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t half_n = static_cast<size_t>(N >> 1);
+    if (pair_idx >= static_cast<size_t>(B) * half_n) return;
 
-完整代码：
-- 基础版：[`solutions/matmul/grouped_gemm_baseline.cu`](./solutions/matmul/grouped_gemm_baseline.cu)
-- 优化版：[`solutions/matmul/grouped_gemm_opt.cu`](./solutions/matmul/grouped_gemm_opt.cu)
+    const int b = static_cast<int>(pair_idx / half_n);
+    const int p = static_cast<int>(pair_idx % half_n);
+    const int j = ((p / h) * (2 * h)) + (p % h);
+    const size_t base = static_cast<size_t>(b) * N;
+    const float u = src[base + j], v = src[base + j + h];
+    dst[base + j]     = (u + v) * post_scale;
+    dst[base + j + h] = (u - v) * post_scale;
+}
+```
+
+在官方评测规模 `B = 8,192, N = 4,096` 下，输入和输出各占 128 MiB。按级启动需要整整 `log2(4096) = 12` 轮全局显存读写，累计搬运 `12 * 256 MiB = 3,072 MiB` 数据，外加 `cudaMalloc` 临时显存分配开销。
+
+> optimized：`4096 = 64 x 64` 寄存器洗牌 + 片上共享内存单遍分解
+
+单行 `4,096` 个浮点数只占 `16 KiB`，完全装得进单个线程块的片上高速缓存。利用阿达玛矩阵的克罗内克积分解 `H_4096 = H_64 (x) H_64`，可以把一整行看成 `64 x 64` 二维矩阵（每行 16 个 `float4`），在单个线程块（256 线程，`16 KiB` shared memory，单个 SM 可并发驻留 3 个块）内一次性算完全部 12 级蝶形：
+
+- **前 6 级行向 `H_64`（`h = 1..32`）零共享内存完成**：每个线程用 `float4` 合并读入 4 组向量。向量内部直接用寄存器加减完成 `h = 1, 2` 两级；随后同一半线程束（连续 16 个线程恰好拼成 64 个浮点数）通过寄存器异或洗牌指令 `__shfl_xor_sync`（同一 warp 的 32 个线程按异或掩码 `1, 2, 4, 8` 直接交换寄存器值）完成 `h = 4, 8, 16, 32` 四级，写进 `__shared__ float4 s_v4[64][16]`，全程零块内同步。
+- **后 6 级列向 `H_64`（`h = 64..2048`）两次基 8 蝶形无冲突收尾**：列向各级只在不同行 `r` 的同一列 `c4 = tid & 15` 之间配对。让相邻 16 个线程固定对齐 `c4 = 0..15`（访问连续 16 个 `float4`，彻底消除共享内存存储体冲突 bank conflict），拆成两轮基 8（Radix-8）蝶形：每轮每个线程把 4 行读进寄存器做两级蝶形，再用一次掩码为 `16` 的 `__shfl_xor_sync` 在前半与后半 warp 之间完成第三级蝶形。整颗 kernel 从头到尾只需两次 `__syncthreads()`，最后乘上 `1 / 64` 并用绕过二级缓存写分配的流式存储指令 `st.global.cs.v4.f32` 直接写回全局显存。
+
+```cuda
+// 1. 行向 H_64（h = 1..32）：float4 寄存器内完成 h=1,2，半 warp 洗牌完成 h=4,8,16,32
+hadamard4_in_reg(v);
+shfl_xor_butterfly_float4(v, 1, lane);
+shfl_xor_butterfly_float4(v, 2, lane);
+shfl_xor_butterfly_float4(v, 4, lane);
+shfl_xor_butterfly_float4(v, 8, lane);
+s_v4[idx4 >> 4][idx4 & 15] = v;
+__syncthreads();
+
+// 2. 列向 H_64（h = 64..2048）：两轮 Radix-8（寄存器 2 级 + lane^16 洗牌 1 级），乘 1/64 流式写回
+// 其余 2 的幂（N <= 32 纯 warp 洗牌，64 <= N <= 8192 单遍 shared memory）自动走对应快路径
+```
+
+这一步把 12 遍全局显存往返彻底压成单遍一读一写，总显存流量从 3,072 MiB 降到 256 MiB（减少 12 倍），同时省去了所有临时显存分配和多余的块内同步。优化版在 LeetGPU 官方 T4 上一次通过全部测试，耗时 **1.19 ms**（第 **92.9** 百分位）；本地 Tesla T4 每次计时前刷空 L2 缓存，在官方评测规模 `B = 8,192, N = 4,096` 下取 15 轮中位数，耗时从基线的 `11.895 ms` 降至 **`0.947 ms`**（提速 **`12.56x`**，单遍等效带宽 **`283.5 GB/s`**）。
+
+完整代码：[多遍全局蝶形基线](./solutions/reduction/hadamard-transform-baseline.cu) · [单遍片上克罗内克分解优化版](./solutions/reduction/hadamard-transform-opt.cu)
 
 ## 困难题
 
