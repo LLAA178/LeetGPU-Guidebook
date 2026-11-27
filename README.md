@@ -2273,6 +2273,7 @@ for (int k_start = 0; k_start <= q_max_row; k_start += kBc) {
 - **64 行共享片上分块 + 4 倍寄存器复用**：64 行 `Q` 共享同一份片上 `K/V` 分块，每个线程同时算 4 行 `Q`，并按 4 个元素一组用 `float4` 读 `sP`，大幅降低全局显存与片上访存压力。
 - **因果剪枝与负载均衡**：按块跳过上三角分块、内部块去分支、逆序发射重负载 block，减少无效计算与尾部等待。
 - **本地实测**：在 `M=5000, d=64` 上，优化版从 `15.323 ms` 降到 `1.526 ms`（提速 `10.04x`）；在 `M=5000, d=128` 上，从 `22.766 ms` 降到 `2.693 ms`（提速 `8.45x`），数值误差均小于 `5e-7`。
+- **LeetGPU 平台实测（T4）**：`v1`（`Br=8`）`18.72 ms`（第 73.8 百分位）→ `v2`（`Br=32`，4 倍寄存器复用 + 逆序调度）`9.05 ms`（第 89.4 百分位）→ `v3`（`Br=64`，64 KB 动态共享内存 + `float4` 读 `sP`）`7.31 ms`（第 90.7 百分位），全部用例通过。
 
 完整代码：
 - baseline：[`solutions/transformer/causal_self_attention_baseline.cu`](./solutions/transformer/causal_self_attention_baseline.cu)
