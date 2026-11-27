@@ -23,6 +23,10 @@
 | Baseline（Warp Online Softmax） | `1.527e-07` | `3.5174 ms` | `1.00×` |
 | Optimized（分块共享内存 + 4× 行复用 + `exp2f`） | `1.453e-07` | `1.7644 ms` | `1.99×` |
 
+**LeetGPU 平台成绩（T4）**
+
+- 优化版：`4.25 ms`，第 `98.8` 百分位
+
 完整代码：
 - 基线版：[`solutions/transformer/attention_with_sinks_baseline.cu`](../../solutions/transformer/attention_with_sinks_baseline.cu)
 - 优化版：[`solutions/transformer/attention_with_sinks_opt.cu`](../../solutions/transformer/attention_with_sinks_opt.cu)
