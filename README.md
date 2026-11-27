@@ -15,7 +15,7 @@
 | --- | --- | --- |
 | [vector-addition](#vector-addition) | [reduction](#reduction) | [multi-head-attention](#multi-head-attention) |
 | [matrix-multiplication](#matrix-multiplication) | [softmax](#softmax) | [gpt-2-transformer-block](#gpt-2-transformer-block) |
-| [matrix-transpose](#matrix-transpose) | [dot-product](#dot-product) |  |
+| [matrix-transpose](#matrix-transpose) | [dot-product](#dot-product) | [causal-self-attention](#causal-self-attention) |
 | [color-inversion](#color-inversion) | [parallel-merge](#parallel-merge) |  |
 | [1d-convolution](#1d-convolution) | [int8-quantized-matmul](#int8-quantized-matmul) |  |
 | [reverse-array](#reverse-array) | [batch-normalization](#batch-normalization) |  |
@@ -2220,3 +2220,57 @@ __global__ void attn(const float* qkv, float* output, const float* weights, int 
 - attention 的 `(token, head, dim)` 映射怎么落到 kernel
 
 完整代码：[`solutions/transformer/gpt-2-transformer-block.cu`](./solutions/transformer/gpt-2-transformer-block.cu)
+
+### [causal-self-attention](https://leetgpu.com/challenges/causal-self-attention)
+*环境: CUDA*
+
+一句话：给定形状为 `M×d` 的 `Q`、`K`、`V`，为第 `i` 个查询位置只对“它自己和之前的键”（`j <= i`）做缩放点积和按行 softmax，再用得到的权重对 `V` 加权求和，相当于把自注意力矩阵的上三角全部遮掉。
+
+举个小例子（`M=2, d=2`）：第 0 行查询只能看到第 0 个键，softmax 权重固定是 `[1.0]`，输出直接等于 `V[0]`；第 1 行查询可以看到第 0、1 两个键，先算出两个缩放点积再做 softmax，把 `V[0]` 和 `V[1]` 按权重混合。
+
+> baseline
+
+每个 warp（线程束，GPU 上同步执行的 32 个线程）负责一行 `Q`，顺序遍历 `0..q_row` 的每一行 `K` 和 `V`，用 Online Softmax（在线 softmax，一边扫一边维护当前最大值和指数和，省去把 `M×M` 注意力分数矩阵写回显存的开销）流式更新输出。
+
+```CUDA
+for (int k_row = 0; k_row <= q_row; ++k_row) {
+    float dot = 0.0f;
+    for (int i = 0; i < elems; ++i) {
+        const int col = lane + i * 32;
+        if (col < d) dot = fmaf(q_reg[i], k_ptr[col], dot);
+    }
+    float score = __shfl_sync(0xffffffff, warp_reduce_sum(dot), 0);
+    float m_new = fmaxf(m, score);
+    float alpha = __expf(m - m_new);
+    float p = __expf(score - m_new);
+    l = l * alpha + p;
+    for (int i = 0; i < elems; ++i) {
+        const int col = lane + i * 32;
+        if (col < d) o_reg[i] = fmaf(p, v_ptr[col], o_reg[i] * alpha);
+    }
+    m = m_new;
+}
+```
+
+> optimized
+
+baseline 里每个 warp 每次只算一行 `Q`，`K` 和 `V` 都要反复从 global memory（全局显存）读；优化版改用 FlashAttention 分块思路：一个 128 线程的 block（线程块，组织成 `8×16`）一次处理 `Br=8` 行 `Q`，每次把 `Bc=32` 行 `K` 或 `V` 搬进 shared memory（片上共享内存，速度远快于全局显存）复用，并用 `float4`（一次读写 4 个 `float` 的 128 位向量指令）加速访存。同时利用因果掩码做了两处剪枝：外层分块循环在 `k_start > q_max_row` 时直接提前结束，整块跳过上三角的无效 `K/V` 搬运与计算；内层 `P @ V` 也只遍历到 `j <= q_row`，省掉乘 0 的尾部循环。
+
+```CUDA
+// 外层按 K/V 分块遍历，超过当前 block 最大查询行后直接提前结束
+for (int k_start = 0; k_start <= q_max_row; k_start += kBc) {
+    // 1. float4 协作加载 K 分块到 shared memory，计算 8x32 局部点积并施加 j <= q_row 掩码
+    // 2. 16 线程子束内用 shuffle 归约完成 Online Softmax，写回 sP
+    // 3. float4 协作加载 V 分块到 shared memory
+    // 4. float4 向量化累加 P @ V，只循环到 j_end = min(kv_len, q_row_global - k_start + 1)
+}
+```
+
+> 省了哪一步与实测效果
+- **减少全局显存重复读取**：`8` 行 `Q` 共享同一份片上 `K/V` 分块，配合 `float4` 向量化读写，显著降低显存带宽压力。
+- **因果提前终止**：按块跳过所有 `k_start > q_max_row` 的上三角分块，整体访存和计算量直接减半。
+- **本地实测**：在 `M=5000, d=64` 上，优化版从 `15.323 ms` 降到 `3.684 ms`（提速 `4.16x`）；在 `M=5000, d=128` 上，从 `22.766 ms` 降到 `7.165 ms`（提速 `3.18x`），数值误差均小于 `5e-7`。
+
+完整代码：
+- baseline：[`solutions/transformer/causal_self_attention_baseline.cu`](./solutions/transformer/causal_self_attention_baseline.cu)
+- optimized：[`solutions/transformer/causal_self_attention_opt.cu`](./solutions/transformer/causal_self_attention_opt.cu)
