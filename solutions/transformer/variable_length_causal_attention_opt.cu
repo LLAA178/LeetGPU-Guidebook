@@ -9,7 +9,8 @@ namespace {
 constexpr int kBr = 32;
 constexpr int kBc = 32;
 constexpr int kThreads = 128;  // For v3 FP32 fallback (d != 64)
-constexpr int kTcThreads = 64; // 2 warps for d=64 Tensor Core (Br=32, Bc=32)
+constexpr int kTcBr = 64;      // 4 warps * 16 Q rows/warp for d=64 Tensor Core
+constexpr int kTcThreads = 128;
 
 __device__ __forceinline__ float subwarp4_max(float val) {
     val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
@@ -91,12 +92,12 @@ __device__ __forceinline__ void mma_m16n8k8_f32(float& d0,
 }
 #endif
 
-// SM 7.5 3-MMA FP16-Split Tensor Core FlashAttention for d=64 (Br=32, Bc=32, 2 warps = 64 threads):
-// - Splits FP32 x = x_hi + x_lo (FP16) and accumulates hi*hi + hi*lo + lo*hi -> FP32 (~1e-6 accuracy).
+// SM 7.5 3-MMA FP16-Split Tensor Core FlashAttention for d=64 (Br=64, Bc=32, 4 warps = 128 threads):
+// - Splits FP32 x = x_hi + x_lo (FP16) and accumulates hi*hi + hi*lo + lo*hi -> FP32 (~2e-6 accuracy).
 // - Q stays 100% in registers (16x64 per warp); pure-register Online Softmax (zero smem for P).
-// - Only 18.0 KB shared memory (sK_hi, sK_lo, sV_hi, sV_lo).
+// - Only 18.0 KB shared memory (sK_hi, sK_lo, sV_hi, sV_lo); 2x less K/V gmem & split traffic vs Br=32.
 // - Compact 1D grid (ceil(T / Br) + S) with reverse per-sequence tile scheduling.
-__global__ void __launch_bounds__(64, 3)
+__global__ void __launch_bounds__(128, 2)
 varlen_causal_attention_tc_d64_kernel(const float* __restrict__ Q,
                                       const float* __restrict__ K,
                                       const float* __restrict__ V,
@@ -117,7 +118,7 @@ varlen_causal_attention_tc_d64_kernel(const float* __restrict__ Q,
         for (int s = 0; s < S; ++s) {
             const int next = cu_seqlens[s + 1];
             const int len = next - prev;
-            const int nb = (len + kBr - 1) / kBr;
+            const int nb = (len + kTcBr - 1) / kTcBr;
             if (bid < acc + nb) {
                 found_start = prev;
                 found_len = len;
@@ -138,8 +139,8 @@ varlen_causal_attention_tc_d64_kernel(const float* __restrict__ Q,
 
     const int seq_len = s_meta[1];
     const int q_block_idx = s_meta[2];
-    const int q_block_row = q_block_idx * kBr;
-    const int q_len = min(kBr, seq_len - q_block_row);
+    const int q_block_row = q_block_idx * kTcBr;
+    const int q_len = min(kTcBr, seq_len - q_block_row);
     const int q_max_row = q_block_row + q_len - 1;
 
     // 18.0 KB total shared memory
@@ -200,9 +201,9 @@ varlen_causal_attention_tc_d64_kernel(const float* __restrict__ Q,
         const int kv_len = min(kBc, seq_len - k_start);
 
         // Cooperatively load K (32x64) and V (32x64 -> transposed 64x32) into sK/sV hi/lo.
-        // 64 threads * 8 float4s = 512 float4s = 32 * 64 floats.
+        // 128 threads * 4 float4s = 512 float4s = 32 * 64 floats.
         #pragma unroll
-        for (int iter = 0; iter < 8; ++iter) {
+        for (int iter = 0; iter < 4; ++iter) {
             const int idx = tid + iter * kTcThreads;  // 0..511
             const int r = idx >> 4;                   // 0..31
             const int c4 = (idx & 15) << 2;           // 0, 4, ..., 60
@@ -711,7 +712,7 @@ extern "C" void solve(const float* Q,
     const float scale = rsqrtf(static_cast<float>(d));
 
     if (d == 64) {
-        const int total_blocks = (T + kBr - 1) / kBr + S;
+        const int total_blocks = (T + kTcBr - 1) / kTcBr + S;
         varlen_causal_attention_tc_d64_kernel<<<total_blocks, kTcThreads>>>(
             Q, K, V, cu_seqlens, output, S, scale);
     } else if ((d & 3) == 0 && d <= 128) {
