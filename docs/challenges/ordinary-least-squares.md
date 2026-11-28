@@ -37,6 +37,6 @@ for (int i = k + 1 + tid; i < F; i += kThreads) {
 }
 ```
 
-将三阶段全局往返压缩为单次 kernel 片上闭环求解、并为大规模超定系统配备无原子分块归约后，不同尺寸的最小二乘回归都能获得极低延迟与可靠的数值精度。在官方性能测试规模 `n_samples = 32, n_features = 32` 下（每次计时前刷空二级缓存，取 15 轮中位数），本地 Tesla T4 实测中位耗时从基线的 `0.084 ms` 降至 **`0.025 ms`**（提速 **`3.42x`**）。
+将三阶段全局往返压缩为单次 kernel 片上闭环求解、并为大规模超定系统配备无原子分块归约后，不同尺寸的最小二乘回归都能获得极低延迟与可靠的数值精度。在官方性能测试规模 `n_samples = 32, n_features = 32` 下（每次计时前刷空二级缓存，取 15 轮中位数），实测中位耗时从基线的 `0.084 ms` 降至 **`0.025 ms`**（提速 **`3.42x`**）；在 LeetGPU 官方 T4 评测中一次通过全部测试，耗时 **0.09 ms**（第 **92.9** 百分位）。
 
 完整代码：[`ordinary-least-squares-baseline.cu`](../../solutions/reduction/ordinary-least-squares-baseline.cu) · [`ordinary-least-squares-opt.cu`](../../solutions/reduction/ordinary-least-squares-opt.cu)
