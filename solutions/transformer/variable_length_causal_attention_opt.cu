@@ -51,9 +51,9 @@ __device__ __forceinline__ int find_seq_start(const int* __restrict__ cu_seqlens
 
 // Tiled float4-vectorized FlashAttention for packed variable-length sequences (Br=32, Bc=32):
 // - Compact 1D grid (ceil(T / Br) + S): eliminates empty 2D-grid blocks with zero host sync.
-// - Reverse per-sequence tile scheduling: heaviest causal tiles launch first.
-// - 4x Q-row register reuse + float4 loads/stores on Q, K, V, sP, output.
-// - Causal early-exit + branch-free interior tiles.
+// - Separate sK and sV buffers (30.0 KB for d=64 -> 2 blocks/SM with 64 KB smem carveout):
+//   loads K & V together and cuts __syncthreads() from 4 to 2 per tile (+ __syncwarp for sP).
+// - Reverse per-sequence tile scheduling + 4x Q-row register reuse + float4 sP loads.
 template <int kVecCols>
 __global__ void __launch_bounds__(128, 2)
 varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
@@ -80,7 +80,6 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
             if (bid < acc + nb) {
                 found_start = prev;
                 found_len = len;
-                // Reverse tile scheduling within each sequence: heaviest causal tiles run first.
                 found_qblk = nb - 1 - (bid - acc);
                 break;
             }
@@ -105,8 +104,9 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
     extern __shared__ float smem[];
     const int d_stride = d + 4;
     float* sQ = smem;
-    float* sKV = sQ + kBr * d_stride;
-    float* sP = sKV + kBc * d_stride;  // 32 * 36
+    float* sK = sQ + kBr * d_stride;
+    float* sV = sK + kBc * d_stride;
+    float* sP = sV + kBc * d_stride;  // 32 * 36
 
     const int ty = tid >> 4;  // 0..7  -> 4 Q rows (ty*4 .. ty*4+3)
     const int tx = tid & 15;  // 0..15 -> 2 K cols / float4 O chunks
@@ -125,7 +125,6 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
         *reinterpret_cast<float4*>(&sQ[r * d_stride + c4 * 4]) =
             make_float4(v.x * scale, v.y * scale, v.z * scale, v.w * scale);
     }
-    __syncthreads();
 
     float4 o_reg[4][kVecCols];
     float m[4];
@@ -147,12 +146,15 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
     for (int k_start = 0; k_start <= q_max_row; k_start += kBc) {
         const int kv_len = min(kBc, seq_len - k_start);
 
+        // Load K and V tiles together before the single pre-compute barrier.
         for (int idx = tid; idx < kv_len * vec_d; idx += kThreads) {
             const int r = idx / vec_d;
             const int c4 = idx % vec_d;
-            *reinterpret_cast<float4*>(&sKV[r * d_stride + c4 * 4]) =
-                *reinterpret_cast<const float4*>(
-                    &K_seq[static_cast<size_t>(k_start + r) * d + c4 * 4]);
+            const size_t off = static_cast<size_t>(k_start + r) * d + c4 * 4;
+            *reinterpret_cast<float4*>(&sK[r * d_stride + c4 * 4]) =
+                *reinterpret_cast<const float4*>(&K_seq[off]);
+            *reinterpret_cast<float4*>(&sV[r * d_stride + c4 * 4]) =
+                *reinterpret_cast<const float4*>(&V_seq[off]);
         }
         __syncthreads();
 
@@ -163,8 +165,8 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
 
         if (is_full_tile) {
             for (int k = 0; k < d; k += 4) {
-                float4 kv0 = *reinterpret_cast<const float4*>(&sKV[k0 * d_stride + k]);
-                float4 kv1 = *reinterpret_cast<const float4*>(&sKV[k1 * d_stride + k]);
+                float4 kv0 = *reinterpret_cast<const float4*>(&sK[k0 * d_stride + k]);
+                float4 kv1 = *reinterpret_cast<const float4*>(&sK[k1 * d_stride + k]);
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     float4 qv = *reinterpret_cast<const float4*>(&sQ[(r_base + i) * d_stride + k]);
@@ -196,9 +198,9 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
             const bool k0_in = (k0 < kv_len);
             const bool k1_in = (k1 < kv_len);
             for (int k = 0; k < d; k += 4) {
-                float4 kv0 = k0_in ? *reinterpret_cast<const float4*>(&sKV[k0 * d_stride + k])
+                float4 kv0 = k0_in ? *reinterpret_cast<const float4*>(&sK[k0 * d_stride + k])
                                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                float4 kv1 = k1_in ? *reinterpret_cast<const float4*>(&sKV[k1 * d_stride + k])
+                float4 kv1 = k1_in ? *reinterpret_cast<const float4*>(&sK[k1 * d_stride + k])
                                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
@@ -240,16 +242,8 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
                 }
             }
         }
-        __syncthreads();
-
-        for (int idx = tid; idx < kv_len * vec_d; idx += kThreads) {
-            const int r = idx / vec_d;
-            const int c4 = idx % vec_d;
-            *reinterpret_cast<float4*>(&sKV[r * d_stride + c4 * 4]) =
-                *reinterpret_cast<const float4*>(
-                    &V_seq[static_cast<size_t>(k_start + r) * d + c4 * 4]);
-        }
-        __syncthreads();
+        // Only the 16-thread subwarp shares its own 4 rows of sP.
+        __syncwarp();
 
         if (kv_len == kBc) {
             for (int j = 0; j < kBc; j += 4) {
@@ -267,7 +261,7 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
 
                 #pragma unroll
                 for (int jj = 0; jj < 4; ++jj) {
-                    const float* v_row = &sKV[(j + jj) * d_stride];
+                    const float* v_row = &sV[(j + jj) * d_stride];
                     #pragma unroll
                     for (int c = 0; c < kVecCols; ++c) {
                         const int col = tx * 4 + c * 64;
@@ -290,7 +284,7 @@ varlen_causal_attention_br32_kernel(const float* __restrict__ Q,
                 const float p1 = sP[(r_base + 1) * 36 + j];
                 const float p2 = sP[(r_base + 2) * 36 + j];
                 const float p3 = sP[(r_base + 3) * 36 + j];
-                const float* v_row = &sKV[j * d_stride];
+                const float* v_row = &sV[j * d_stride];
                 #pragma unroll
                 for (int c = 0; c < kVecCols; ++c) {
                     const int col = tx * 4 + c * 64;
@@ -421,13 +415,21 @@ extern "C" void solve(const float* Q,
     if ((d & 3) == 0 && d <= 128) {
         const int d_stride = d + 4;
         const size_t smem_bytes =
-            (static_cast<size_t>(kBr + kBc) * d_stride + static_cast<size_t>(kBr) * 36) *
+            (static_cast<size_t>(kBr + 2 * kBc) * d_stride + static_cast<size_t>(kBr) * 36) *
             sizeof(float);
         const int total_blocks = (T + kBr - 1) / kBr + S;
         if (d <= 64) {
+            cudaFuncSetAttribute(varlen_causal_attention_br32_kernel<1>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 100);
             varlen_causal_attention_br32_kernel<1><<<total_blocks, kThreads, smem_bytes>>>(
                 Q, K, V, cu_seqlens, output, d, S, scale);
         } else {
+            if (smem_bytes > 48 * 1024) {
+                cudaFuncSetAttribute(varlen_causal_attention_br32_kernel<2>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     static_cast<int>(smem_bytes));
+            }
             varlen_causal_attention_br32_kernel<2><<<total_blocks, kThreads, smem_bytes>>>(
                 Q, K, V, cu_seqlens, output, d, S, scale);
         }
