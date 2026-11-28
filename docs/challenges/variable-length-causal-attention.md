@@ -68,10 +68,23 @@ for (int k_start = 0; k_start <= q_max_row; k_start += kBc) {
 }
 ```
 
+> tensor core
+
+在 `d=64` 的基准形状下，FP32 CUDA Core 已接近算力上限。若直接把输入降成单份 FP16 送入 Tensor Core（张量核心，GPU 上专做小矩阵乘加的硬件单元），精度误差约 `1e-3`，无法满足本题 `atol=1e-4` 的要求。因此采用 **3-MMA FP16 拆分**方案：把每个 FP32 拆成高位与残差两份 FP16（`x = x_hi + x_lo`），用三条 `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` 指令累加 `hi·hi + hi·lo + lo·hi` 到 FP32，把误差压到 `2.2e-6` 量级。配合 `Br=32, Bc=32`（2 个 warp、64 线程）：
+- **Q 常驻寄存器 + 纯寄存器 Online Softmax**：每个 warp 负责 16 行 `Q`，预缩放并拆分后的 `q_hi/q_lo` 全程留在寄存器；`QK^T` 得到的 `s_reg` 直接在 4 线程子束内做归约和 softmax，生成的 `p_reg` 恰好符合下一阶段 `P @ V` 的 MMA A-fragment 布局，彻底省去 `sP` 共享内存与额外 shuffle。
+- **18.0 KB 共享内存实现高并发**：片上仅存放 `sK_hi/sK_lo` 与转置后的 `sV_hi/sV_lo`（共 `18.0 KB`），单 SM 可并发 3 个 block，核心 kernel 编译实现 0 字节寄存器溢出。
+
+```CUDA
+// 3-MMA 累加 hi*hi + hi*lo + lo*hi -> FP32
+mma_m16n8k8_f32(s0, s1, s2, s3, qh0, qh1, kh);
+mma_m16n8k8_f32(s0, s1, s2, s3, qh0, qh1, kl);
+mma_m16n8k8_f32(s0, s1, s2, s3, ql0, ql1, kh);
+```
+
 > 省了哪一步与实测效果
-- **消除 `T×T` 中间矩阵与空 block 调度**：紧凑一维网格把发射块数从 `8192` 压到 `288`，按 `cu_seqlens` 直接切到单条序列并做 `Br=32, Bc=32` 片上分块，32 行 `Q` 共享同一份 `K/V` 搬运，配合 4 倍寄存器复用和 `float4` 向量化，核心 kernel 编译实现 0 字节寄存器溢出。
-- **因果剪枝与多序列均衡**：块级提前终止跳过上三角，逆序发射让各序列最重的分块优先占满 SM，减少尾部波次空转。
-- **本地实测**：在官方基准规模（`T=8192, d=64, S=32`，序列长度分布于 `128..384`）下，优化版平均耗时从 `1.6933 ms` 降到 `0.1643 ms`（提速 `10.30x`），相对 FP64 CPU 参考实现的最大绝对误差为 `9.537e-07`。
+- **消除 `T×T` 中间矩阵与空 block 调度**：紧凑一维网格把发射块数从 `8192` 压到 `288`，按 `cu_seqlens` 直接切到单条序列并做序列内逆序调度，让最重的因果分块先跑。
+- **3-MMA Tensor Core + 纯寄存器 Softmax**：在 `d=64` 上用 3 条 FP16 MMA 保住 FP32 级别精度，`Q` 与 `P` 均不落共享内存，片上仅占 `18.0 KB`。
+- **本地实测**：在官方基准规模（`T=8192, d=64, S=32`，序列长度分布于 `128..384`）下，平均耗时从 baseline 的 `1.6933 ms` 降到 FP32 优化版的 `0.1645 ms`（`10.30x`），再降到 3-MMA Tensor Core 版的 `0.1130 ms`（提速 `14.98x`），相对 FP64 CPU 参考实现的最大绝对误差为 `2.205e-06`。
 
 完整代码：
 - baseline：[`solutions/transformer/variable_length_causal_attention_baseline.cu`](../../solutions/transformer/variable_length_causal_attention_baseline.cu)
