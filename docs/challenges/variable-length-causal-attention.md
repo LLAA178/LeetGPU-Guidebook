@@ -85,6 +85,7 @@ mma_m16n8k8_f32(s0, s1, s2, s3, ql0, ql1, kh);
 - **消除 `T×T` 中间矩阵与空 block 调度**：紧凑一维网格把发射块数从 `8192` 压到 `288`，按 `cu_seqlens` 直接切到单条序列并做序列内逆序调度，让最重的因果分块先跑。
 - **3-MMA Tensor Core + 纯寄存器 Softmax**：在 `d=64` 上用 3 条 FP16 MMA 保住 FP32 级别精度，`Q` 与 `P` 均不落共享内存，片上仅占 `18.0 KB`。
 - **本地实测**：在官方基准规模（`T=8192, d=64, S=32`，序列长度分布于 `128..384`）下，平均耗时从 baseline 的 `1.6933 ms` 降到 FP32 优化版的 `0.1645 ms`（`10.30x`），再降到 3-MMA Tensor Core（`Br=64, Bc=32`）版的 `0.0726 ms`（提速 `23.32x`），相对 FP64 CPU 参考实现的最大绝对误差为 `2.205e-06`。
+- **平台实测（LeetGPU T4）**：全部测试一次通过，最终耗时 **`0.21 ms`**（提交时第 **`90.0`** 百分位）。各版本演进：`v1` FP32 紧凑网格 `0.51 ms`（第 `57.1` 百分位）→ `v2` 序列内逆序调度 `0.49 ms`（第 `71.4` 百分位）→ `v3` `sK/sV` 分离双缓冲 `0.46 ms`（第 `75.0` 百分位）→ `v4` 3-MMA Tensor Core（`Br=32, Bc=32`）`0.28 ms`（第 `88.9` 百分位）→ `v5` 扩大分块至 `Br=64, Bc=32` 复用 `K/V` 搬运与拆分 `0.21 ms`（第 `90.0` 百分位）。
 
 完整代码：
 - baseline：[`solutions/transformer/variable_length_causal_attention_baseline.cu`](../../solutions/transformer/variable_length_causal_attention_baseline.cu)
