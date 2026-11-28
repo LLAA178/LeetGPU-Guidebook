@@ -38,6 +38,6 @@ const int vec4_cnt = rem >> 2;
 const int4* __restrict__ row4 = reinterpret_cast<const int4*>(row_ptr + head);
 ```
 
-在 `10,000 × 10,000`（`S_ROW = 0..9998, S_COL = 1..9999`）基准评测中（每次计时前刷空二级缓存，取 15 轮中位数），基线版耗时 `1.74 ms`，优化版降至 **`1.29 ms`**（提速 **`1.35x`**，有效带宽达 **`309.0 GB/s`**）。
+在 `10,000 × 10,000`（`S_ROW = 0..9998, S_COL = 1..9999`）基准评测中（每次计时前刷空二级缓存，取 15 轮中位数），基线版耗时 `1.74 ms`，优化版降至 **`1.29 ms`**（提速 **`1.35x`**，有效带宽达 **`309.0 GB/s`**）；在 LeetGPU 官方 T4 评测中一次通过全部测试，耗时 **1.57 ms**（第 **93.2** 百分位）。
 
 完整代码：[二维标量两阶段基线](../../solutions/reduction/2d-subarray-sum-baseline.cu) · [逐行对齐 int4 单次归约优化版](../../solutions/reduction/2d-subarray-sum-opt.cu)
