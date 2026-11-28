@@ -35,6 +35,6 @@ float s2 = fmaf(v2.x, v2.x, v2.y * v2.y) + fmaf(v2.z, v2.z, v2.w * v2.w);
 float s3 = fmaf(v3.x, v3.x, v3.y * v3.y) + fmaf(v3.z, v3.z, v3.w * v3.w);
 ```
 
-在官方性能测试规模 `N = 100,000` 下（每次计时前刷空 L2 缓存，取 15 轮中位数），两级标量基线版耗时 `0.0199 ms`，向量化尾块收尾优化版降至 **`0.0124 ms`**（提速 **`1.60x`**）。
+在官方性能测试规模 `N = 100,000` 下（每次计时前刷空 L2 缓存，取 15 轮中位数），两级标量基线版耗时 `0.0199 ms`，向量化尾块收尾优化版降至 **`0.0124 ms`**（提速 **`1.60x`**）；在 LeetGPU 官方 T4 评测中一次通过全部测试，耗时 **0.03 ms**（第 **98.5** 百分位）。
 
 完整代码：[两级归约标量基线](../../solutions/normalization/rms-normalization-baseline.cu) · [8 路 float4 与尾块收尾优化版](../../solutions/normalization/rms-normalization-opt.cu)
