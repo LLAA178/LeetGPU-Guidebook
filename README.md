@@ -17,19 +17,57 @@
 
 | 简单题 | 中等题 | 困难题 |
 | --- | --- | --- |
-| [vector-addition](#vector-addition) | [reduction](#reduction) | [multi-head-attention](#multi-head-attention) |
-| [matrix-multiplication](#matrix-multiplication) | [softmax](#softmax) | [gpt-2-transformer-block](#gpt-2-transformer-block) |
-| [matrix-transpose](#matrix-transpose) | [dot-product](#dot-product) |  |
-| [color-inversion](#color-inversion) | [parallel-merge](#parallel-merge) |  |
-| [1d-convolution](#1d-convolution) | [int8-quantized-matmul](#int8-quantized-matmul) |  |
-| [reverse-array](#reverse-array) | [batch-normalization](#batch-normalization) |  |
-| [relu](#relu) | [rotary-positional-embedding](#rotary-positional-embedding) |  |
-| [leaky-relu](#leaky-relu) | [rms-normalization](#rms-normalization) |  |
-| [rainbow-table](#rainbow-table) | [weight-dequantization](#weight-dequantization) |  |
-| [matrix-copy](#matrix-copy) | [general-matrix-multiplication](#general-matrix-multiplication) |  |
-| [count-array-element](#count-array-element) | [hadamard-transform](#hadamard-transform) |  |
-| [count-2d-array-element](#count-2d-array-element) |  |  |
-| [value-clipping](#value-clipping) |  |  |
+| [vector-addition](#vector-addition) | [count-array-element](#count-array-element) | [multi-head-attention](#multi-head-attention) |
+| [matrix-multiplication](#matrix-multiplication) | [count-2d-array-element](#count-2d-array-element) · [优化版](docs/challenges/count-2d-array-element.md) | [gpt-2-transformer-block](#gpt-2-transformer-block) |
+| [matrix-transpose](#matrix-transpose) · [优化版](docs/challenges/matrix-transpose.md) | [reduction](#reduction) | [all-pairs-shortest-paths](docs/challenges/all-pairs-shortest-paths.md) |
+| [color-inversion](#color-inversion) | [softmax](#softmax) | [bfs-shortest-path](docs/challenges/bfs-shortest-path.md) |
+| [1d-convolution](#1d-convolution) · [优化版](docs/challenges/1d-convolution.md) | [dot-product](#dot-product) | [causal-self-attention](docs/challenges/causal-self-attention.md) |
+| [reverse-array](#reverse-array) | [parallel-merge](#parallel-merge) · [优化版](docs/challenges/parallel-merge.md) | [k-means-clustering](docs/challenges/k-means-clustering.md) |
+| [relu](#relu) | [int8-quantized-matmul](#int8-quantized-matmul) | [linear-self-attention](docs/challenges/linear-self-attention.md) |
+| [leaky-relu](#leaky-relu) | [batch-normalization](#batch-normalization) | [multi-agent-simulation](docs/challenges/multi-agent-simulation.md) |
+| [rainbow-table](#rainbow-table) · [优化版](docs/challenges/rainbow-table.md) | [rotary-positional-embedding](#rotary-positional-embedding) | [multi-head-cross-attention](docs/challenges/multi-head-cross-attention.md) |
+| [matrix-copy](#matrix-copy) | [rms-normalization](#rms-normalization) · [优化版](docs/challenges/rms-normalization.md) | [radix-sort](docs/challenges/radix-sort.md) |
+| [value-clipping](#value-clipping) | [weight-dequantization](#weight-dequantization) | [sliding-window-self-attention](docs/challenges/sliding-window-self-attention.md) |
+| [gaussian-error-gated-linear-unit](docs/challenges/gaussian-error-gated-linear-unit.md) | [general-matrix-multiplication](#general-matrix-multiplication) | [sorting](docs/challenges/sorting.md) |
+|  | [hadamard-transform](#hadamard-transform) |  |
+|  | [2d-convolution](docs/challenges/2d-convolution.md) |  |
+|  | [2d-jacobi-stencil](docs/challenges/2d-jacobi-stencil.md) |  |
+|  | [2d-max-pooling](docs/challenges/2d-max-pooling.md) |  |
+|  | [2d-subarray-sum](docs/challenges/2d-subarray-sum.md) |  |
+|  | [3d-convolution](docs/challenges/3d-convolution.md) |  |
+|  | [3d-subarray-sum](docs/challenges/3d-subarray-sum.md) |  |
+|  | [attention-with-linear-biases](docs/challenges/attention-with-linear-biases.md) |  |
+|  | [attention-with-sinks](docs/challenges/attention-with-sinks.md) |  |
+|  | [batched-matrix-multiplication](docs/challenges/batched-matrix-multiplication.md) |  |
+|  | [causal-depthwise-conv1d](docs/challenges/causal-depthwise-conv1d.md) |  |
+|  | [decaying-causal-attention](docs/challenges/decaying-causal-attention.md) |  |
+|  | [distillation-kl-divergence](docs/challenges/distillation-kl-divergence.md) |  |
+|  | [fp16-batched-matrix-multiplication](docs/challenges/fp16-batched-matrix-multiplication.md) |  |
+|  | [fused-residual-add-and-rms-norm](docs/challenges/fused-residual-add-and-rms-norm.md) |  |
+|  | [gaussian-blur](docs/challenges/gaussian-blur.md) |  |
+|  | [grouped-gemm](docs/challenges/grouped-gemm.md) |  |
+|  | [grouped-query-attention](docs/challenges/grouped-query-attention.md) |  |
+|  | [histogramming](docs/challenges/histogramming.md) |  |
+|  | [layer-normalization](docs/challenges/layer-normalization.md) |  |
+|  | [linear-recurrence](docs/challenges/linear-recurrence.md) |  |
+|  | [lora-linear](docs/challenges/lora-linear.md) |  |
+|  | [max-subarray-sum](docs/challenges/max-subarray-sum.md) |  |
+|  | [muon-optimizer](docs/challenges/muon-optimizer.md) |  |
+|  | [nearest-neighbor](docs/challenges/nearest-neighbor.md) |  |
+|  | [ordinary-least-squares](docs/challenges/ordinary-least-squares.md) |  |
+|  | [parallel-reverse-scan-gae](docs/challenges/parallel-reverse-scan-gae.md) |  |
+|  | [ppo-clipped-surrogate-loss](docs/challenges/ppo-clipped-surrogate-loss.md) |  |
+|  | [prefix-sum](docs/challenges/prefix-sum.md) |  |
+|  | [softmax-attention](docs/challenges/softmax-attention.md) |  |
+|  | [sparse-matrix-dense-matrix-multiplication](docs/challenges/sparse-matrix-dense-matrix-multiplication.md) |  |
+|  | [sparse-matrix-vector-multiplication](docs/challenges/sparse-matrix-vector-multiplication.md) |  |
+|  | [speculative-decoding-verification](docs/challenges/speculative-decoding-verification.md) |  |
+|  | [ssm-selective-scan](docs/challenges/ssm-selective-scan.md) |  |
+|  | [stream-compaction](docs/challenges/stream-compaction.md) |  |
+|  | [token-embedding-layer](docs/challenges/token-embedding-layer.md) |  |
+|  | [top-k-selection](docs/challenges/top-k-selection.md) |  |
+|  | [top-p-sampling](docs/challenges/top-p-sampling.md) |  |
+|  | [variable-length-causal-attention](docs/challenges/variable-length-causal-attention.md) |  |
 
 ## 简单题
 ### [vector-addition](https://leetgpu.com/challenges/vector-addition)
