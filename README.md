@@ -15,59 +15,67 @@
 
 ## 索引
 
-| 简单题 | 中等题 | 困难题 |
-| --- | --- | --- |
-| [vector-addition](#vector-addition) | [count-array-element](#count-array-element) | [multi-head-attention](#multi-head-attention) |
-| [matrix-multiplication](#matrix-multiplication) | [count-2d-array-element](#count-2d-array-element) · [优化版](docs/challenges/count-2d-array-element.md) | [gpt-2-transformer-block](#gpt-2-transformer-block) |
-| [matrix-transpose](#matrix-transpose) · [优化版](docs/challenges/matrix-transpose.md) | [reduction](#reduction) | [all-pairs-shortest-paths](docs/challenges/all-pairs-shortest-paths.md) |
-| [color-inversion](#color-inversion) | [softmax](#softmax) | [bfs-shortest-path](docs/challenges/bfs-shortest-path.md) |
-| [1d-convolution](#1d-convolution) · [优化版](docs/challenges/1d-convolution.md) | [dot-product](#dot-product) | [causal-self-attention](docs/challenges/causal-self-attention.md) |
-| [reverse-array](#reverse-array) | [parallel-merge](#parallel-merge) · [优化版](docs/challenges/parallel-merge.md) | [k-means-clustering](docs/challenges/k-means-clustering.md) |
-| [relu](#relu) | [int8-quantized-matmul](#int8-quantized-matmul) | [linear-self-attention](docs/challenges/linear-self-attention.md) |
-| [leaky-relu](#leaky-relu) | [batch-normalization](#batch-normalization) | [multi-agent-simulation](docs/challenges/multi-agent-simulation.md) |
-| [rainbow-table](#rainbow-table) · [优化版](docs/challenges/rainbow-table.md) | [rotary-positional-embedding](#rotary-positional-embedding) | [multi-head-cross-attention](docs/challenges/multi-head-cross-attention.md) |
-| [matrix-copy](#matrix-copy) | [rms-normalization](#rms-normalization) · [优化版](docs/challenges/rms-normalization.md) | [radix-sort](docs/challenges/radix-sort.md) |
-| [value-clipping](#value-clipping) | [weight-dequantization](#weight-dequantization) | [sliding-window-self-attention](docs/challenges/sliding-window-self-attention.md) |
-| [gaussian-error-gated-linear-unit](docs/challenges/gaussian-error-gated-linear-unit.md) | [general-matrix-multiplication](#general-matrix-multiplication) | [sorting](docs/challenges/sorting.md) |
-|  | [hadamard-transform](#hadamard-transform) |  |
-|  | [2d-convolution](docs/challenges/2d-convolution.md) |  |
-|  | [2d-jacobi-stencil](docs/challenges/2d-jacobi-stencil.md) |  |
-|  | [2d-max-pooling](docs/challenges/2d-max-pooling.md) |  |
-|  | [2d-subarray-sum](docs/challenges/2d-subarray-sum.md) |  |
-|  | [3d-convolution](docs/challenges/3d-convolution.md) |  |
-|  | [3d-subarray-sum](docs/challenges/3d-subarray-sum.md) |  |
-|  | [attention-with-linear-biases](docs/challenges/attention-with-linear-biases.md) |  |
-|  | [attention-with-sinks](docs/challenges/attention-with-sinks.md) |  |
-|  | [batched-matrix-multiplication](docs/challenges/batched-matrix-multiplication.md) |  |
-|  | [causal-depthwise-conv1d](docs/challenges/causal-depthwise-conv1d.md) |  |
-|  | [decaying-causal-attention](docs/challenges/decaying-causal-attention.md) |  |
-|  | [distillation-kl-divergence](docs/challenges/distillation-kl-divergence.md) |  |
-|  | [fp16-batched-matrix-multiplication](docs/challenges/fp16-batched-matrix-multiplication.md) |  |
-|  | [fused-residual-add-and-rms-norm](docs/challenges/fused-residual-add-and-rms-norm.md) |  |
-|  | [gaussian-blur](docs/challenges/gaussian-blur.md) |  |
-|  | [grouped-gemm](docs/challenges/grouped-gemm.md) |  |
-|  | [grouped-query-attention](docs/challenges/grouped-query-attention.md) |  |
-|  | [histogramming](docs/challenges/histogramming.md) |  |
-|  | [layer-normalization](docs/challenges/layer-normalization.md) |  |
-|  | [linear-recurrence](docs/challenges/linear-recurrence.md) |  |
-|  | [lora-linear](docs/challenges/lora-linear.md) |  |
-|  | [max-subarray-sum](docs/challenges/max-subarray-sum.md) |  |
-|  | [muon-optimizer](docs/challenges/muon-optimizer.md) |  |
-|  | [nearest-neighbor](docs/challenges/nearest-neighbor.md) |  |
-|  | [ordinary-least-squares](docs/challenges/ordinary-least-squares.md) |  |
-|  | [parallel-reverse-scan-gae](docs/challenges/parallel-reverse-scan-gae.md) |  |
-|  | [ppo-clipped-surrogate-loss](docs/challenges/ppo-clipped-surrogate-loss.md) |  |
-|  | [prefix-sum](docs/challenges/prefix-sum.md) |  |
-|  | [softmax-attention](docs/challenges/softmax-attention.md) |  |
-|  | [sparse-matrix-dense-matrix-multiplication](docs/challenges/sparse-matrix-dense-matrix-multiplication.md) |  |
-|  | [sparse-matrix-vector-multiplication](docs/challenges/sparse-matrix-vector-multiplication.md) |  |
-|  | [speculative-decoding-verification](docs/challenges/speculative-decoding-verification.md) |  |
-|  | [ssm-selective-scan](docs/challenges/ssm-selective-scan.md) |  |
-|  | [stream-compaction](docs/challenges/stream-compaction.md) |  |
-|  | [token-embedding-layer](docs/challenges/token-embedding-layer.md) |  |
-|  | [top-k-selection](docs/challenges/top-k-selection.md) |  |
-|  | [top-p-sampling](docs/challenges/top-p-sampling.md) |  |
-|  | [variable-length-causal-attention](docs/challenges/variable-length-causal-attention.md) |  |
+[简单 · 12 题](#简单题导览)　·　[中等 · 51 题](#中等题导览)　·　[困难 · 12 题](#困难题导览)
+
+### 简单题导览
+
+| 数组与矩阵 | 卷积、激活与其他 |
+| --- | --- |
+| [Vector Addition](#vector-addition) | [1D Convolution](#1d-convolution) · [优化版](docs/challenges/1d-convolution.md) |
+| [Matrix Copy](#matrix-copy) | [Color Inversion](#color-inversion) |
+| [Matrix Transpose](#matrix-transpose) · [优化版](docs/challenges/matrix-transpose.md) | [ReLU](#relu) |
+| [Matrix Multiplication](#matrix-multiplication) | [Leaky ReLU](#leaky-relu) |
+| [Reverse Array](#reverse-array) | [Gaussian Error Gated Linear Unit](docs/challenges/gaussian-error-gated-linear-unit.md) |
+| [Value Clipping](#value-clipping) | [Rainbow Table](#rainbow-table) · [优化版](docs/challenges/rainbow-table.md) |
+
+### 中等题导览
+
+| 矩阵、线性代数与量化 | 注意力与序列模型 |
+| --- | --- |
+| [General Matrix Multiplication](#general-matrix-multiplication) | [Softmax Attention](docs/challenges/softmax-attention.md) |
+| [Batched Matrix Multiplication](docs/challenges/batched-matrix-multiplication.md) | [Grouped Query Attention](docs/challenges/grouped-query-attention.md) |
+| [FP16 Batched Matrix Multiplication](docs/challenges/fp16-batched-matrix-multiplication.md) | [Attention With Linear Biases](docs/challenges/attention-with-linear-biases.md) |
+| [Grouped GEMM](docs/challenges/grouped-gemm.md) | [Attention With Sinks](docs/challenges/attention-with-sinks.md) |
+| [Sparse Matrix Vector Multiplication](docs/challenges/sparse-matrix-vector-multiplication.md) | [Decaying Causal Attention](docs/challenges/decaying-causal-attention.md) |
+| [Sparse Matrix Dense Matrix Multiplication](docs/challenges/sparse-matrix-dense-matrix-multiplication.md) | [Variable Length Causal Attention](docs/challenges/variable-length-causal-attention.md) |
+| [LoRA Linear](docs/challenges/lora-linear.md) | [Rotary Positional Embedding](#rotary-positional-embedding) |
+| [INT8 Quantized Matmul](#int8-quantized-matmul) | [Token Embedding Layer](docs/challenges/token-embedding-layer.md) |
+| [Weight Dequantization](#weight-dequantization) | [Linear Recurrence](docs/challenges/linear-recurrence.md) |
+| [Dot Product](#dot-product) | [SSM Selective Scan](docs/challenges/ssm-selective-scan.md) |
+| [Hadamard Transform](#hadamard-transform) | [Speculative Decoding Verification](docs/challenges/speculative-decoding-verification.md) |
+
+| 归约、扫描与选择 | 空间算子与邻域计算 |
+| --- | --- |
+| [Reduction](#reduction) | [2D Convolution](docs/challenges/2d-convolution.md) |
+| [Count Array Element](#count-array-element) | [3D Convolution](docs/challenges/3d-convolution.md) |
+| [Count 2D Array Element](#count-2d-array-element) · [优化版](docs/challenges/count-2d-array-element.md) | [Causal Depthwise Conv1D](docs/challenges/causal-depthwise-conv1d.md) |
+| [Histogramming](docs/challenges/histogramming.md) | [2D Max Pooling](docs/challenges/2d-max-pooling.md) |
+| [Prefix Sum](docs/challenges/prefix-sum.md) | [Gaussian Blur](docs/challenges/gaussian-blur.md) |
+| [Parallel Reverse Scan GAE](docs/challenges/parallel-reverse-scan-gae.md) | [2D Jacobi Stencil](docs/challenges/2d-jacobi-stencil.md) |
+| [Stream Compaction](docs/challenges/stream-compaction.md) | [2D Subarray Sum](docs/challenges/2d-subarray-sum.md) |
+| [Parallel Merge](#parallel-merge) · [优化版](docs/challenges/parallel-merge.md) | [3D Subarray Sum](docs/challenges/3d-subarray-sum.md) |
+| [Max Subarray Sum](docs/challenges/max-subarray-sum.md) | [Nearest Neighbor](docs/challenges/nearest-neighbor.md) |
+| [Top-K Selection](docs/challenges/top-k-selection.md) |  |
+| [Top-p Sampling](docs/challenges/top-p-sampling.md) |  |
+
+| 归一化与概率 | 训练与优化 |
+| --- | --- |
+| [Batch Normalization](#batch-normalization) | [Ordinary Least Squares](docs/challenges/ordinary-least-squares.md) |
+| [Layer Normalization](docs/challenges/layer-normalization.md) | [Muon Optimizer](docs/challenges/muon-optimizer.md) |
+| [RMS Normalization](#rms-normalization) · [优化版](docs/challenges/rms-normalization.md) | [Distillation KL Divergence](docs/challenges/distillation-kl-divergence.md) |
+| [Fused Residual Add And RMS Norm](docs/challenges/fused-residual-add-and-rms-norm.md) | [PPO Clipped Surrogate Loss](docs/challenges/ppo-clipped-surrogate-loss.md) |
+| [Softmax](#softmax) |  |
+
+### 困难题导览
+
+| 注意力与 Transformer | 图、排序与模拟 |
+| --- | --- |
+| [Multi Head Attention](#multi-head-attention) | [Bfs Shortest Path](docs/challenges/bfs-shortest-path.md) |
+| [Multi Head Cross Attention](docs/challenges/multi-head-cross-attention.md) | [All Pairs Shortest Paths](docs/challenges/all-pairs-shortest-paths.md) |
+| [Causal Self Attention](docs/challenges/causal-self-attention.md) | [Radix Sort](docs/challenges/radix-sort.md) |
+| [Sliding Window Self Attention](docs/challenges/sliding-window-self-attention.md) | [Sorting](docs/challenges/sorting.md) |
+| [Linear Self Attention](docs/challenges/linear-self-attention.md) | [K Means Clustering](docs/challenges/k-means-clustering.md) |
+| [GPT-2 Transformer Block](#gpt-2-transformer-block) | [Multi Agent Simulation](docs/challenges/multi-agent-simulation.md) |
 
 ## 简单题
 ### [vector-addition](https://leetgpu.com/challenges/vector-addition)
